@@ -94,6 +94,37 @@ def exclude_payments(df):
     exclude_categories = ['Payment', 'Settlement', 'payment', 'settlement']
     return df[~df['Category'].isin(exclude_categories)]
 
+# Income calculation functions
+def normalize_to_monthly(amount, frequency):
+    """Convert any frequency to monthly amount"""
+    multipliers = {
+        'weekly': 4.33,
+        'biweekly': 2.17,
+        'monthly': 1,
+        'annual': 1/12
+    }
+    return amount * multipliers.get(frequency, 1)
+
+def calculate_net_income(amount, is_net, tax_rate):
+    """Calculate net income if gross is provided"""
+    if is_net:
+        return amount
+    return amount * (1 - tax_rate / 100)
+
+def get_total_monthly_income(income_entries, as_of_date=None):
+    """Calculate total monthly income as of specific date"""
+    dm = get_data_manager()
+    active_entries = dm.get_income_entries(active_only=True, as_of_date=as_of_date)
+    
+    total = 0
+    for entry in active_entries:
+        monthly = normalize_to_monthly(entry['amount'], entry['frequency'])
+        net = calculate_net_income(monthly, entry['is_net'], entry.get('tax_rate', 0))
+        # For now, assume all in ILS or handle currency later
+        total += net
+    
+    return total
+
 def show_setup_wizard():
     """First-time setup wizard"""
     st.title("👋 Welcome to ExpenseInfo!")
@@ -346,9 +377,14 @@ def show_overview(df):
     current_month_data = df_expenses[df_expenses['Date'].dt.date >= current_month]
     current_month_spending = current_month_data['Cost'].sum()
     
+    # Get income data
+    dm = get_data_manager()
+    income_entries = dm.load_income_data().get('income_entries', [])
+    total_monthly_income = get_total_monthly_income(income_entries)
+    
     # Display metrics
     st.header("📊 Summary Metrics")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric(
@@ -370,6 +406,43 @@ def show_overview(df):
             f"₪{current_month_spending:,.0f}",
             f"{delta:+,.0f} ({delta_pct:+.1f}%)"
         )
+    
+    with col4:
+        if total_monthly_income > 0:
+            expense_ratio = (current_month_spending / total_monthly_income) * 100
+            st.metric(
+                "Expense Ratio",
+                f"{expense_ratio:.1f}%",
+                help="Current month expenses as % of monthly income"
+            )
+        else:
+            st.metric(
+                "Expense Ratio",
+                "N/A",
+                help="Add income sources in Income & Savings page"
+            )
+    
+    # Show income vs expense comparison if income data exists
+    if total_monthly_income > 0:
+        st.markdown("---")
+        st.subheader("💰 Income vs Expenses (Current Month)")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Monthly Income", f"₪{total_monthly_income:,.0f}")
+        
+        with col2:
+            st.metric("Current Month Expenses", f"₪{current_month_spending:,.0f}")
+        
+        with col3:
+            savings = total_monthly_income - current_month_spending
+            savings_rate = (savings / total_monthly_income * 100) if total_monthly_income > 0 else 0
+            st.metric(
+                "Savings This Month",
+                f"₪{savings:,.0f}",
+                f"{savings_rate:.1f}% savings rate"
+            )
     
     st.markdown("---")
     
@@ -455,6 +528,341 @@ def show_overview(df):
             use_container_width=True,
             hide_index=True
         )
+
+def show_income_tracking():
+    """Income tracking and savings page"""
+    st.title("💰 Income & Savings")
+    
+    dm = get_data_manager()
+    income_data = dm.load_income_data()
+    income_entries = income_data.get('income_entries', [])
+    
+    # Summary metrics
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        total_monthly_income = get_total_monthly_income(income_entries)
+        st.metric("Total Monthly Income", f"₪{total_monthly_income:,.0f}")
+    
+    with col2:
+        active_sources = len(dm.get_income_entries(active_only=True))
+        total_sources = len(income_entries)
+        st.metric("Active Income Sources", f"{active_sources} / {total_sources}")
+    
+    with col3:
+        # Calculate expense ratio if transaction data exists
+        if dm.data_exists():
+            df = dm.get_dataframe()
+            if not df.empty:
+                # Get current month expenses
+                now = datetime.now()
+                current_month_df = df[
+                    (df['Date'].dt.year == now.year) & 
+                    (df['Date'].dt.month == now.month)
+                ]
+                df_expenses = exclude_payments(current_month_df)
+                monthly_expenses = df_expenses['Cost'].sum()
+                
+                if total_monthly_income > 0:
+                    expense_ratio = (monthly_expenses / total_monthly_income) * 100
+                    st.metric("Expense Ratio (This Month)", f"{expense_ratio:.1f}%")
+                else:
+                    st.metric("Expense Ratio (This Month)", "N/A")
+            else:
+                st.metric("Expense Ratio (This Month)", "N/A")
+        else:
+            st.metric("Expense Ratio (This Month)", "N/A")
+    
+    st.markdown("---")
+    
+    # Add income source button
+    if st.button("➕ Add Income Source", type="primary"):
+        st.session_state['show_income_modal'] = True
+        st.session_state['edit_income_id'] = None
+    
+    # Income entry modal
+    if st.session_state.get('show_income_modal', False):
+        show_income_entry_modal(dm, st.session_state.get('edit_income_id'))
+    
+    # Display income sources
+    st.subheader("Current Income Sources")
+    
+    if income_entries:
+        # Group by member
+        members = {}
+        for entry in income_entries:
+            member_name = entry.get('member_name', 'Unknown')
+            if member_name not in members:
+                members[member_name] = []
+            members[member_name].append(entry)
+        
+        for member_name, member_entries in members.items():
+            st.markdown(f"### {member_name}")
+            
+            for entry in member_entries:
+                # Check if active
+                is_active = entry in dm.get_income_entries(active_only=True)
+                status_icon = "✅" if is_active else "⏸️"
+                
+                # Calculate monthly amount
+                monthly = normalize_to_monthly(entry['amount'], entry['frequency'])
+                net = calculate_net_income(monthly, entry['is_net'], entry.get('tax_rate', 0))
+                
+                # Display income source card
+                with st.container():
+                    col1, col2 = st.columns([4, 1])
+                    
+                    with col1:
+                        st.markdown(f"**{status_icon} {entry['source']}** - {entry['category']}")
+                        income_type = "Net" if entry['is_net'] else f"Gross (Tax: {entry.get('tax_rate', 0)}%)"
+                        st.markdown(f"₪{net:,.0f}/month ({income_type})")
+                        st.caption(f"Started: {entry['start_date']}" + 
+                                 (f" | Ended: {entry['end_date']}" if entry.get('end_date') else " | Ongoing"))
+                        if entry.get('notes'):
+                            st.caption(f"📝 {entry['notes']}")
+                    
+                    with col2:
+                        col_edit, col_delete = st.columns(2)
+                        with col_edit:
+                            if st.button("✏️", key=f"edit_{entry['id']}", help="Edit"):
+                                st.session_state['show_income_modal'] = True
+                                st.session_state['edit_income_id'] = entry['id']
+                                st.rerun()
+                        with col_delete:
+                            if st.button("🗑️", key=f"delete_{entry['id']}", help="Delete"):
+                                if dm.delete_income_entry(entry['id']):
+                                    st.success("Income source deleted!")
+                                    st.rerun()
+                    
+                    st.markdown("---")
+    else:
+        st.info("No income sources added yet. Click 'Add Income Source' to get started!")
+    
+    # Income breakdown visualization
+    if income_entries:
+        st.subheader("📊 Income Breakdown")
+        
+        tab1, tab2, tab3 = st.tabs(["By Source", "By Category", "By Member"])
+        
+        with tab1:
+            # Income by source
+            active_entries = dm.get_income_entries(active_only=True)
+            if active_entries:
+                income_by_source = []
+                for entry in active_entries:
+                    monthly = normalize_to_monthly(entry['amount'], entry['frequency'])
+                    net = calculate_net_income(monthly, entry['is_net'], entry.get('tax_rate', 0))
+                    income_by_source.append({
+                        'Source': entry['source'],
+                        'Amount': net
+                    })
+                
+                df_source = pd.DataFrame(income_by_source)
+                fig_source = px.pie(
+                    df_source,
+                    values='Amount',
+                    names='Source',
+                    title='Income Distribution by Source'
+                )
+                st.plotly_chart(fig_source, use_container_width=True)
+        
+        with tab2:
+            # Income by category
+            active_entries = dm.get_income_entries(active_only=True)
+            if active_entries:
+                income_by_category = {}
+                for entry in active_entries:
+                    monthly = normalize_to_monthly(entry['amount'], entry['frequency'])
+                    net = calculate_net_income(monthly, entry['is_net'], entry.get('tax_rate', 0))
+                    category = entry['category']
+                    income_by_category[category] = income_by_category.get(category, 0) + net
+                
+                df_category = pd.DataFrame([
+                    {'Category': k, 'Amount': v}
+                    for k, v in income_by_category.items()
+                ])
+                
+                fig_category = px.bar(
+                    df_category,
+                    x='Category',
+                    y='Amount',
+                    title='Income by Category'
+                )
+                st.plotly_chart(fig_category, use_container_width=True)
+        
+        with tab3:
+            # Income by member
+            active_entries = dm.get_income_entries(active_only=True)
+            if active_entries:
+                income_by_member = {}
+                for entry in active_entries:
+                    monthly = normalize_to_monthly(entry['amount'], entry['frequency'])
+                    net = calculate_net_income(monthly, entry['is_net'], entry.get('tax_rate', 0))
+                    member = entry.get('member_name', 'Unknown')
+                    income_by_member[member] = income_by_member.get(member, 0) + net
+                
+                df_member = pd.DataFrame([
+                    {'Member': k, 'Amount': v}
+                    for k, v in income_by_member.items()
+                ])
+                
+                fig_member = px.bar(
+                    df_member,
+                    x='Member',
+                    y='Amount',
+                    title='Income by Household Member'
+                )
+                st.plotly_chart(fig_member, use_container_width=True)
+
+def show_income_entry_modal(dm, edit_id=None):
+    """Modal for adding/editing income entry"""
+    # Get existing entry if editing
+    existing_entry = None
+    if edit_id:
+        income_data = dm.load_income_data()
+        existing_entry = next((e for e in income_data['income_entries'] if e['id'] == edit_id), None)
+    
+    modal_title = "Edit Income Source" if existing_entry else "Add Income Source"
+    
+    with st.form("income_entry_form", clear_on_submit=True):
+        st.subheader(modal_title)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            member_name = st.text_input(
+                "Member Name",
+                value=existing_entry['member_name'] if existing_entry else "",
+                help="Name of the household member receiving this income"
+            )
+            
+            source = st.text_input(
+                "Income Source",
+                value=existing_entry['source'] if existing_entry else "",
+                placeholder="e.g., Salary - Company A",
+                help="Description of the income source"
+            )
+            
+            category = st.selectbox(
+                "Category",
+                options=["Salary", "Freelance", "Investment", "Rental", "Other"],
+                index=["Salary", "Freelance", "Investment", "Rental", "Other"].index(existing_entry['category']) if existing_entry else 0
+            )
+        
+        with col2:
+            amount = st.number_input(
+                "Amount",
+                min_value=0.0,
+                value=float(existing_entry['amount']) if existing_entry else 0.0,
+                step=100.0
+            )
+            
+            currency = st.selectbox(
+                "Currency",
+                options=["ILS", "USD", "EUR"],
+                index=["ILS", "USD", "EUR"].index(existing_entry['currency']) if existing_entry else 0
+            )
+            
+            frequency = st.selectbox(
+                "Frequency",
+                options=["monthly", "annual", "weekly", "biweekly"],
+                index=["monthly", "annual", "weekly", "biweekly"].index(existing_entry['frequency']) if existing_entry else 0
+            )
+        
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            is_net = st.radio(
+                "Income Type",
+                options=[True, False],
+                format_func=lambda x: "Net (After Tax)" if x else "Gross (Before Tax)",
+                index=0 if (existing_entry and existing_entry['is_net']) else 1 if existing_entry else 0
+            )
+        
+        with col4:
+            tax_rate = st.number_input(
+                "Tax Rate (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(existing_entry.get('tax_rate', 0)) if existing_entry else 0.0,
+                step=0.5,
+                disabled=is_net,
+                help="Only needed for gross income"
+            )
+        
+        col5, col6 = st.columns(2)
+        
+        with col5:
+            start_date = st.date_input(
+                "Start Date",
+                value=datetime.fromisoformat(existing_entry['start_date']).date() if existing_entry else datetime.now().date()
+            )
+        
+        with col6:
+            has_end_date = st.checkbox(
+                "Has End Date",
+                value=bool(existing_entry and existing_entry.get('end_date'))
+            )
+            
+            if has_end_date:
+                end_date = st.date_input(
+                    "End Date",
+                    value=datetime.fromisoformat(existing_entry['end_date']).date() if existing_entry and existing_entry.get('end_date') else datetime.now().date()
+                )
+            else:
+                end_date = None
+        
+        notes = st.text_area(
+            "Notes",
+            value=existing_entry.get('notes', '') if existing_entry else "",
+            placeholder="Optional notes about this income source"
+        )
+        
+        col_save, col_cancel = st.columns(2)
+        
+        with col_save:
+            submitted = st.form_submit_button("💾 Save", type="primary", use_container_width=True)
+        
+        with col_cancel:
+            cancelled = st.form_submit_button("❌ Cancel", use_container_width=True)
+        
+        if submitted:
+            # Validate inputs
+            if not member_name or not source or amount <= 0:
+                st.error("Please fill in all required fields with valid values")
+            else:
+                # Create income entry
+                income_entry = {
+                    'member_name': member_name,
+                    'source': source,
+                    'amount': amount,
+                    'currency': currency,
+                    'frequency': frequency,
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat() if end_date else None,
+                    'is_net': is_net,
+                    'tax_rate': tax_rate if not is_net else 0.0,
+                    'category': category,
+                    'notes': notes
+                }
+                
+                if existing_entry:
+                    # Update existing
+                    dm.update_income_entry(edit_id, income_entry)
+                    st.success("Income source updated!")
+                else:
+                    # Add new
+                    dm.add_income_entry(income_entry)
+                    st.success("Income source added!")
+                
+                st.session_state['show_income_modal'] = False
+                st.session_state['edit_income_id'] = None
+                st.rerun()
+        
+        if cancelled:
+            st.session_state['show_income_modal'] = False
+            st.session_state['edit_income_id'] = None
+            st.rerun()
 
 def show_analytics(df):
     """Show analytics page with detailed charts"""
@@ -608,10 +1016,10 @@ def main():
     
     # Navigation
     st.sidebar.header("📊 Navigation")
-    page = st.sidebar.radio("Select Page", ["Overview", "Analytics", "Data Management"])
+    page = st.sidebar.radio("Select Page", ["Overview", "Analytics", "Income & Savings", "Data Management"])
     
-    # Filters (if not on data management page)
-    if page != "Data Management" and not df.empty:
+    # Filters (if not on data management or income page)
+    if page not in ["Data Management", "Income & Savings"] and not df.empty:
         st.sidebar.header("🔍 Filters")
         
         # Date range filter
@@ -643,6 +1051,8 @@ def main():
             show_analytics(df)
         else:
             st.info("No data available. Go to Data Management to import data.")
+    elif page == "Income & Savings":
+        show_income_tracking()
     elif page == "Data Management":
         show_data_management()
 

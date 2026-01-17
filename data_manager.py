@@ -15,6 +15,7 @@ class DataManager:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.data_file = self.data_dir / "transactions.json"
+        self.income_file = self.data_dir / "income_data.json"
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(exist_ok=True)
         self.backup_dir = self.data_dir / "backups"
@@ -291,3 +292,151 @@ class DataManager:
     def data_exists(self):
         """Check if data file exists"""
         return self.data_file.exists() and self.data_file.stat().st_size > 0
+    
+    # Income tracking methods
+    def _create_empty_income_dataset(self):
+        """Create an empty income dataset structure"""
+        return {
+            "metadata": {
+                "version": "1.0",
+                "last_updated": datetime.now().isoformat(),
+                "total_entries": 0
+            },
+            "income_entries": []
+        }
+    
+    def load_income_data(self):
+        """Load income data with file locking"""
+        if not self.income_file.exists():
+            return self._create_empty_income_dataset()
+        
+        with open(self.income_file, 'r', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)  # Shared lock for reading
+            try:
+                data = json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        
+        return data
+    
+    def save_income_data(self, data):
+        """Save income data with automatic backup and file locking"""
+        # Create backup first if file exists
+        if self.income_file.exists():
+            self._create_income_backup()
+        
+        # Update metadata
+        data['metadata']['last_updated'] = datetime.now().isoformat()
+        data['metadata']['total_entries'] = len(data['income_entries'])
+        
+        # Save new data with exclusive lock
+        with open(self.income_file, 'w', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)  # Exclusive lock for writing
+            try:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        
+        # Clear cache
+        self._clear_cache()
+    
+    def add_income_entry(self, income_entry):
+        """Add a new income entry"""
+        data = self.load_income_data()
+        
+        # Generate unique ID
+        income_entry['id'] = self._generate_id()
+        income_entry['created_at'] = datetime.now().isoformat()
+        
+        data['income_entries'].append(income_entry)
+        self.save_income_data(data)
+        
+        return income_entry['id']
+    
+    def update_income_entry(self, entry_id, updated_entry):
+        """Update an existing income entry"""
+        data = self.load_income_data()
+        
+        for i, entry in enumerate(data['income_entries']):
+            if entry['id'] == entry_id:
+                # Keep original id and created_at
+                updated_entry['id'] = entry['id']
+                updated_entry['created_at'] = entry.get('created_at', datetime.now().isoformat())
+                updated_entry['updated_at'] = datetime.now().isoformat()
+                data['income_entries'][i] = updated_entry
+                self.save_income_data(data)
+                return True
+        
+        return False
+    
+    def delete_income_entry(self, entry_id):
+        """Delete an income entry"""
+        data = self.load_income_data()
+        original_count = len(data['income_entries'])
+        
+        data['income_entries'] = [
+            entry for entry in data['income_entries']
+            if entry['id'] != entry_id
+        ]
+        
+        if len(data['income_entries']) < original_count:
+            self.save_income_data(data)
+            return True
+        
+        return False
+    
+    def get_income_entries(self, active_only=False, as_of_date=None):
+        """Get income entries, optionally filtered by active status and date"""
+        data = self.load_income_data()
+        entries = data['income_entries']
+        
+        if not active_only:
+            return entries
+        
+        # Filter by date if specified
+        if as_of_date is None:
+            as_of_date = datetime.now().date()
+        elif isinstance(as_of_date, str):
+            as_of_date = datetime.fromisoformat(as_of_date).date()
+        elif isinstance(as_of_date, datetime):
+            as_of_date = as_of_date.date()
+        
+        active_entries = []
+        for entry in entries:
+            # Check start date
+            start_date = datetime.fromisoformat(entry['start_date']).date()
+            if start_date > as_of_date:
+                continue
+            
+            # Check end date
+            end_date = entry.get('end_date')
+            if end_date:
+                end_date = datetime.fromisoformat(end_date).date()
+                if end_date < as_of_date:
+                    continue
+            
+            active_entries.append(entry)
+        
+        return active_entries
+    
+    def _create_income_backup(self):
+        """Create backup of current income data"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = self.backup_dir / f"income_backup_{timestamp}.json"
+        
+        # Copy current file
+        shutil.copy(self.income_file, backup_file)
+        
+        # Maintain only N most recent backups
+        self._cleanup_old_backups(keep=5, pattern="income_backup_*.json")
+    
+    def _cleanup_old_backups(self, keep=5, pattern="transactions_backup_*.json"):
+        """Keep only N most recent backups"""
+        backups = sorted(self.backup_dir.glob(pattern))
+        if len(backups) > keep:
+            for old_backup in backups[:-keep]:
+                old_backup.unlink()
+    
+    def income_data_exists(self):
+        """Check if income data file exists"""
+        return self.income_file.exists() and self.income_file.stat().st_size > 0
