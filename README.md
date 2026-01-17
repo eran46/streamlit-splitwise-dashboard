@@ -1,4 +1,4 @@
-# ExpenseInfo 💰
+# streamlit-splitwise-dashboard 💰
 
 A Streamlit-based Python application to visualize and analyze Splitwise expense data in an interactive and informative way, with persistent data storage and comprehensive data management.
 
