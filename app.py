@@ -178,69 +178,111 @@ if uploaded_file is not None:
         
         # Page routing
         if page == "Overview":
-            # OVERVIEW PAGE - Pie chart and Transaction table
+            # OVERVIEW PAGE - Tabs for different views
             st.header("📊 Overview")
             
-            # Pie chart
-            if not df_expenses.empty:
-                category_totals = df_expenses.groupby('Category')['Cost'].sum().sort_values(ascending=False)
+            tab1, tab2 = st.tabs(["Category Breakdown", "Trends & History"])
+            
+            with tab1:
+                # Pie chart
+                if not df_expenses.empty:
+                    category_totals = df_expenses.groupby('Category')['Cost'].sum().sort_values(ascending=False).reset_index()
+                    category_totals.columns = ['Category', 'Cost']
+                    
+                    fig_pie = px.pie(
+                        category_totals,
+                        values='Cost',
+                        names='Category',
+                        hole=0.4,
+                        color_discrete_sequence=px.colors.qualitative.Pastel
+                    )
+                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig_pie, use_container_width=True, config={
+                        'scrollZoom': False,
+                        'displayModeBar': False,
+                        'doubleClick': False
+                    })
+                else:
+                    st.info("No expense data available for the selected filters")
+            
+            with tab2:
+                # Monthly spending trend
+                if not df_all_expenses.empty:
+                    trend_data = df_all_expenses.groupby(df_all_expenses['Date'].dt.to_period('M'))['Cost'].sum().reset_index()
+                    trend_data['Date'] = trend_data['Date'].dt.to_timestamp()
+                    
+                    fig_trend = go.Figure()
+                    # Actual Spending
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_data['Date'],
+                        y=trend_data['Cost'],
+                        mode='lines+markers',
+                        name='Actual Spending',
+                        line=dict(color='#636EFA', width=3)
+                    ))
+                    # Average Line
+                    if historic_avg > 0:
+                        fig_trend.add_trace(go.Scatter(
+                            x=trend_data['Date'],
+                            y=[historic_avg]*len(trend_data),
+                            mode='lines',
+                            name='Historic Average',
+                            line=dict(color='red', dash='dash')
+                        ))
+                    
+                    fig_trend.update_layout(
+                        xaxis_title="Month",
+                        yaxis_title="Amount (₪)",
+                        hovermode='x unified'
+                    )
+                    st.plotly_chart(fig_trend, use_container_width=True, config={
+                        'scrollZoom': False,
+                        'displayModeBar': False,
+                        'doubleClick': False
+                    })
+                else:
+                    st.info("No expense data available")
+            
+            # Searchable data table in expander
+            with st.expander("🔎 View Transaction Details"):
+                # Search box
+                search_term = st.text_input("Search transactions (by description or date)", "")
                 
-                fig_pie = px.pie(
-                    values=category_totals.values,
-                    names=category_totals.index,
-                    title="Spending by Category",
-                    hole=0.3
+                # Filter data based on search
+                if search_term:
+                    mask = df_filtered.astype(str).apply(
+                        lambda x: x.str.contains(search_term, case=False, na=False)
+                    ).any(axis=1)
+                    df_display = df_filtered[mask]
+                else:
+                    df_display = df_filtered
+                
+                # Display transaction count
+                st.markdown(f"**Showing {len(df_display)} of {len(df_filtered)} transactions**")
+                
+                # Format the dataframe for display
+                df_show = df_display.copy()
+                df_show['Date'] = df_show['Date'].dt.strftime('%Y-%m-%d')
+                df_show['Cost'] = df_show['Cost'].apply(lambda x: f"₪{x:,.2f}")
+                
+                # Remove the YearMonth column from display
+                if 'YearMonth' in df_show.columns:
+                    df_show = df_show.drop('YearMonth', axis=1)
+                
+                st.dataframe(
+                    df_show,
+                    use_container_width=True,
+                    hide_index=True
                 )
-                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig_pie, use_container_width=True, config={
-                    'scrollZoom': False,
-                    'displayModeBar': False,
-                    'doubleClick': False
-                })
-            else:
-                st.info("No expense data available for the selected filters")
-            
-            # Searchable data table
-            st.header("🔎 Transaction Details")
-            
-            # Search box
-            search_term = st.text_input("Search transactions", "")
-            
-            # Filter data based on search
-            if search_term:
-                mask = df_filtered.astype(str).apply(
-                    lambda x: x.str.contains(search_term, case=False, na=False)
-                ).any(axis=1)
-                df_display = df_filtered[mask]
-            else:
-                df_display = df_filtered
-            
-            # Display transaction count
-            st.markdown(f"**Showing {len(df_display)} of {len(df_filtered)} transactions**")
-            
-            # Format the dataframe for display
-            df_show = df_display.copy()
-            df_show['Date'] = df_show['Date'].dt.strftime('%Y-%m-%d')
-            df_show['Cost'] = df_show['Cost'].apply(lambda x: f"₪{x:,.2f}")
-            
-            # Remove the YearMonth column from display
-            if 'YearMonth' in df_show.columns:
-                df_show = df_show.drop('YearMonth', axis=1)
-            
-            st.dataframe(
-                df_show,
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Download filtered data
-            csv = df_display.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 Download Filtered Data as CSV",
-                data=csv,
-                file_name=f"splitwise_expenses_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
+                
+                # Download filtered data
+                csv = df_display.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label="📥 Download Filtered Data as CSV",
+                    data=csv,
+                    file_name=f"splitwise_expenses_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
         
         else:  # Analytics page
             # ANALYTICS PAGE - All trend charts
