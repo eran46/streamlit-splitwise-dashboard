@@ -1,2 +1,5 @@
 /feature_planning
-/user_data
+user_data/
+*.pkl
+__pycache__/
+*.pyc
