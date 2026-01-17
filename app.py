@@ -196,7 +196,7 @@ if uploaded_file is not None:
                         hole=0.4,
                         color_discrete_sequence=px.colors.qualitative.Pastel
                     )
-                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    fig_pie.update_traces(textposition='auto', textinfo='percent+label')
                     st.plotly_chart(fig_pie, use_container_width=True, config={
                         'scrollZoom': False,
                         'displayModeBar': False,
@@ -425,6 +425,7 @@ if uploaded_file is not None:
                 fig_yoy.update_layout(
                     xaxis_title="Year",
                     yaxis_title="Monthly Average (₪)",
+                    xaxis_type='category',
                     legend=dict(
                         orientation="v",
                         yanchor="top",
