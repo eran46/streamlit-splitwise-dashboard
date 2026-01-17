@@ -127,7 +127,7 @@ def get_total_monthly_income(income_entries, as_of_date=None):
 
 def show_setup_wizard():
     """First-time setup wizard"""
-    st.title("👋 Welcome to ExpenseInfo!")
+    st.title("👋 Welcome to streamlit-splitwise-dashboard !")
     st.markdown("Let's set up your expense tracking system.")
     
     col1, col2 = st.columns(2)
@@ -1001,7 +1001,7 @@ def show_analytics(df):
     st.plotly_chart(fig_yoy, use_container_width=True)
 
 def main():
-    st.title("💰 ExpenseInfo")
+    st.title("💰 streamlit-splitwise-dashboard")
     
     # Check if data exists
     dm = get_data_manager()
