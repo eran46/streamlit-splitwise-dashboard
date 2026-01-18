@@ -460,11 +460,40 @@ def show_data_management():
     """Data management page"""
     st.title("💾 Data Management")
     
-    dm = get_data_manager()
+    # Group selector at the top
+    groups_mgr = get_groups_manager()
+    groups = groups_mgr.get_all_groups()
+    
+    if not groups:
+        st.warning("No groups available. Create a group in the Manage Groups page first.")
+        return
+    
+    # Get current active group
+    active_group = groups_mgr.get_active_group()
+    active_group_id = active_group['id'] if active_group else groups[0]['id']
+    
+    # Find index of active group for default selection
+    default_index = next((i for i, g in enumerate(groups) if g['id'] == active_group_id), 0)
+    
+    # Group selector
+    st.markdown("### 📁 Select Group for Data Management")
+    selected_group = st.selectbox(
+        "Choose which group's data to manage:",
+        options=groups,
+        format_func=lambda g: f"{g['emoji']} {g['name']}",
+        index=default_index,
+        key="data_mgmt_group_selector"
+    )
+    
+    # Get data manager for the selected group
+    group_path = groups_mgr.get_group_data_path(selected_group['id'])
+    dm = DataManager(group_path)
     data = dm.load_data()
     
+    st.markdown("---")
+    
     # Current dataset info
-    st.subheader("📊 Current Dataset")
+    st.subheader(f"📊 Current Dataset - {selected_group['emoji']} {selected_group['name']}")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -523,14 +552,11 @@ def show_data_management():
                     result = dm.append_transactions(transactions)
                     
                     # Update group members from uploaded data
-                    groups_mgr = get_groups_manager()
-                    if groups_mgr.has_groups():
-                        active_group = groups_mgr.get_active_group()
-                        updated_members = update_group_members_from_data(active_group['id'], df)
-                        if updated_members:
-                            st.info(f"📝 Updated group members: {', '.join(updated_members)}")
+                    updated_members = update_group_members_from_data(selected_group['id'], df)
+                    if updated_members:
+                        st.info(f"📝 Updated group members: {', '.join(updated_members)}")
                     
-                    st.success(f"✅ Added {result['added']} new transactions")
+                    st.success(f"✅ Added {result['added']} new transactions to {selected_group['emoji']} {selected_group['name']}")
                     
                     if result['skipped'] > 0:
                         st.warning(f"⚠️ Skipped {result['skipped']} duplicate transactions")
@@ -1831,6 +1857,8 @@ def show_analytics(df):
     
     # Year-over-Year analysis
     st.subheader("Year-over-Year Monthly Average")
+    
+    # Category selector
     selected_category_yoy = st.selectbox(
         "Select Category",
         options=categories,
@@ -1843,37 +1871,65 @@ def show_analytics(df):
     
     df_yoy['Year'] = df_yoy['Date'].dt.year
     df_yoy['Month'] = df_yoy['Date'].dt.month
+    df_yoy['YearMonth'] = df_yoy['Date'].dt.to_period('M').astype(str)
     
     # Calculate monthly totals using Cost
-    monthly_totals_yoy = df_yoy.groupby(['Year', 'Month', 'Category'])['Cost'].sum().reset_index()
-    monthly_totals_yoy.columns = ['Year', 'Month', 'Category', 'Total']
-    yoy_avg = monthly_totals_yoy.groupby(['Year', 'Category'])['Total'].mean().reset_index()
-    yoy_avg.columns = ['Year', 'Category', 'Monthly Average']
-    yoy_avg['Year'] = yoy_avg['Year'].astype(str)
+    monthly_totals_yoy = df_yoy.groupby(['YearMonth', 'Year', 'Month', 'Category'])['Cost'].sum().reset_index()
+    monthly_totals_yoy.columns = ['YearMonth', 'Year', 'Month', 'Category', 'Total']
     
-    fig_yoy = px.line(
-        yoy_avg,
-        x='Year',
-        y='Monthly Average',
-        color='Category',
-        title=f"Monthly Average by Category (Year-over-Year) - {selected_category_yoy}",
-        markers=True
-    )
-    
-    fig_yoy.update_layout(
-        xaxis_title="Year",
-        yaxis_title="Monthly Average (₪)",
-        xaxis_type='category',
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.02
+    # Date range selector for this plot
+    if not monthly_totals_yoy.empty:
+        col1, col2 = st.columns(2)
+        
+        available_months = sorted(monthly_totals_yoy['YearMonth'].unique())
+        
+        with col1:
+            start_month = st.selectbox(
+                "Start Month",
+                options=available_months,
+                index=0,
+                key="yoy_start_month"
+            )
+        
+        with col2:
+            end_month = st.selectbox(
+                "End Month",
+                options=available_months,
+                index=len(available_months) - 1,
+                key="yoy_end_month"
+            )
+        
+        # Filter data by selected range
+        monthly_totals_yoy = monthly_totals_yoy[
+            (monthly_totals_yoy['YearMonth'] >= start_month) & 
+            (monthly_totals_yoy['YearMonth'] <= end_month)
+        ]
+        
+        # Create plot showing monthly values for each category
+        fig_yoy = px.line(
+            monthly_totals_yoy,
+            x='YearMonth',
+            y='Total',
+            color='Category',
+            title=f"Monthly Spending by Category - {selected_category_yoy}",
+            markers=True
         )
-    )
-    
-    st.plotly_chart(fig_yoy, use_container_width=True)
+        
+        fig_yoy.update_layout(
+            xaxis_title="Month",
+            yaxis_title="Amount (₪)",
+            legend=dict(
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.02
+            )
+        )
+        
+        st.plotly_chart(fig_yoy, use_container_width=True)
+    else:
+        st.info("No data available for the selected category")
 
 def main():
     st.title("💰 streamlit-splitwise-dashboard")
