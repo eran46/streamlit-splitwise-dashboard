@@ -13,6 +13,7 @@ from user_expense_calculator import UserExpenseCalculator
 from currency_manager import CurrencyManager, get_currency_symbol, format_currency_amount, get_currency_name
 from exchange_rate_manager import ExchangeRateManager
 from database_migrations.migration_manager import MigrationManager
+from transaction_metadata_manager import TransactionMetadataManager
 
 # Page configuration
 st.set_page_config(
@@ -36,6 +37,15 @@ def get_currency_manager():
 def get_exchange_rate_manager():
     """Singleton exchange rate manager"""
     return ExchangeRateManager()
+
+def get_metadata_manager(group_data_path=None):
+    """Get metadata manager for specific group or active group"""
+    if group_data_path is None:
+        groups_mgr = get_groups_manager()
+        if groups_mgr.has_groups():
+            active_group = groups_mgr.get_active_group()
+            group_data_path = groups_mgr.get_group_data_path(active_group['id'])
+    return TransactionMetadataManager(group_data_path)
 
 def get_data_manager(group_data_path=None):
     """Get data manager for specific group or active group"""
@@ -526,30 +536,6 @@ def render_group_selector():
         if st.button("⚙️ Manage", use_container_width=True, key="manage_groups_btn"):
             st.session_state.navigate_to_manage_groups = True
             st.rerun()
-    
-    # Currency selector
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💱 Dashboard Currency")
-    
-    # Get dashboard-wide target currency from CurrencyManager
-    currency_mgr = get_currency_manager()
-    target_currency = currency_mgr.get_target_currency()
-    
-    if target_currency:
-        # Show target currency with symbol
-        symbol = get_currency_symbol(target_currency)
-        currency_name = get_currency_name(target_currency)
-        
-        st.sidebar.info(f"""**{target_currency} {symbol}**  
-{currency_name}
-
-ℹ️ All amounts displayed in this currency  
-💡 Change via Data Management → Database Import""")
-    else:
-        # Dashboard not initialized yet
-        st.sidebar.warning("""⚠️ **Currency Not Set**
-
-Import your first Splitwise file to set up your dashboard currency.""")
 
 def get_available_currencies():
     """Get all currencies available in current group's data"""
@@ -857,7 +843,7 @@ def show_data_management():
     groups = groups_mgr.get_all_groups()
     
     if not groups:
-        st.warning("No groups available. Create a group in the Manage Groups page first.")
+        st.warning("No groups available. Create a group in the Groups page first.")
         return
     
     # Get current active group
@@ -1351,7 +1337,7 @@ def show_overview(df):
     
     # Display metrics
     st.header("📊 Summary Metrics")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     
     with col1:
         st.metric(
@@ -1365,44 +1351,34 @@ def show_overview(df):
             f"₪{historic_avg:,.0f}"
         )
     
-    with col3:
-        delta = current_month_spending - historic_avg
-        delta_pct = (delta / historic_avg * 100) if historic_avg > 0 else 0
-        st.metric(
-            "Current Month",
-            f"₪{current_month_spending:,.0f}",
-            f"{delta:+,.0f} ({delta_pct:+.1f}%)"
-        )
-    
-    with col4:
-        if total_monthly_income > 0:
+    # Show income vs expense comparison if income data exists
+    if total_monthly_income > 0:
+        st.markdown("---")
+        st.subheader("💰 Income vs Expenses (Current Month)")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Monthly Income", f"₪{total_monthly_income:,.0f}")
+        
+        with col2:
+            delta = current_month_spending - historic_avg
+            delta_pct = (delta / historic_avg * 100) if historic_avg > 0 else 0
+            st.metric(
+                "Current Month Expenses",
+                f"₪{current_month_spending:,.0f}",
+                f"{delta:+,.0f} ({delta_pct:+.1f}%)"
+            )
+        
+        with col3:
             expense_ratio = (current_month_spending / total_monthly_income) * 100
             st.metric(
                 "Expense Ratio",
                 f"{expense_ratio:.1f}%",
                 help="Current month expenses as % of monthly income"
             )
-        else:
-            st.metric(
-                "Expense Ratio",
-                "N/A",
-                help="Add income sources in Income & Savings page"
-            )
-    
-    # Show income vs expense comparison if income data exists
-    if total_monthly_income > 0:
-        st.markdown("---")
-        st.subheader("💰 Income vs Expenses (Current Month)")
         
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Monthly Income", f"₪{total_monthly_income:,.0f}")
-        
-        with col2:
-            st.metric("Current Month Expenses", f"₪{current_month_spending:,.0f}")
-        
-        with col3:
+        with col4:
             savings = total_monthly_income - current_month_spending
             savings_rate = (savings / total_monthly_income * 100) if total_monthly_income > 0 else 0
             st.metric(
@@ -1599,38 +1575,100 @@ def show_overview(df):
         else:
             st.info("No expense data available")
     
-    # Transaction details
-    with st.expander("🔍 Transaction Details"):
+    # Tag Analytics
+    show_tag_analytics(df)
+    
+    # All Transactions with integrated notes and tags
+    with st.expander("🔍 All Transactions", expanded=True):
         st.subheader("All Transactions")
         
-        search = st.text_input("🔍 Search transactions", placeholder="Search by description, category...")
+        metadata_mgr = get_metadata_manager()
+        all_tags = sorted(metadata_mgr.get_all_tags())
+        tag_counts = metadata_mgr.get_tag_counts()
+        
+        # Tag filter is now in main sidebar under Filters section
+        # Check if tags were selected in sidebar
+        selected_tags = []
+        if all_tags:
+            for tag in all_tags:
+                if f"tag_filter_{tag}" in st.session_state and st.session_state[f"tag_filter_{tag}"]:
+                    selected_tags.append(tag)
+        
+        # Apply tag filter
+        display_df = df.copy()
+        if selected_tags:
+            filtered_ids = set()
+            for tag in selected_tags:
+                filtered_ids.update(metadata_mgr.get_transactions_by_tag(tag))
+            
+            display_df['transaction_id'] = display_df.apply(
+                lambda row: metadata_mgr.create_transaction_id(
+                    str(row['Date']), row['Description'], row['Cost']
+                ), axis=1
+            )
+            display_df = display_df[display_df['transaction_id'].isin(filtered_ids)]
+            st.info(f"Showing {len(display_df)} transactions with tags: {', '.join(selected_tags)}")
+        
+        # Search box
+        search = st.text_input("🔍 Search transactions", placeholder="Search by description, category, or notes...")
         
         if search:
-            mask = (
-                df['Description'].str.contains(search, case=False, na=False) |
-                df['Category'].str.contains(search, case=False, na=False)
+            # Search in notes
+            matching_ids = metadata_mgr.search_notes(search)
+            
+            display_df['transaction_id'] = display_df.apply(
+                lambda row: metadata_mgr.create_transaction_id(
+                    str(row['Date']), row['Description'], row['Cost']
+                ), axis=1
             )
-            display_df = df[mask]
-        else:
-            display_df = df
+            
+            mask = (
+                display_df['Description'].str.contains(search, case=False, na=False) |
+                display_df['Category'].str.contains(search, case=False, na=False) |
+                display_df['transaction_id'].isin(matching_ids)
+            )
+            display_df = display_df[mask]
         
         # Prepare display with original currency info
         display_data = display_df.copy()
         
-        # Add formatted amount column that shows original currency if different
+        # Add transaction IDs for metadata lookup
+        display_data['transaction_id'] = display_data.apply(
+            lambda row: metadata_mgr.create_transaction_id(
+                str(row['Date']), row['Description'], row['Cost']
+            ), axis=1
+        )
+        
+        # Add notes indicator and tags columns
+        def get_note_indicator(txn_id):
+            metadata = metadata_mgr.get_transaction_metadata(txn_id)
+            return "📝" if metadata.get('notes', '').strip() else ""
+        
+        def get_tags_display(txn_id):
+            metadata = metadata_mgr.get_transaction_metadata(txn_id)
+            tags = metadata.get('tags', [])
+            if not tags:
+                return ""
+            # Show up to 3 tags, then +N more
+            if len(tags) <= 3:
+                return ", ".join(tags)
+            else:
+                return f"{', '.join(tags[:3])} +{len(tags)-3}"
+        
+        display_data['💬'] = display_data['transaction_id'].apply(get_note_indicator)
+        display_data['Tags'] = display_data['transaction_id'].apply(get_tags_display)
+        
+        # Add formatted amount column
         if 'original_cost' in display_data.columns and 'original_currency' in display_data.columns:
-            # Convert to dict records for easier processing
             dm = get_data_manager()
             data = dm.load_data()
             transactions = data.get('transactions', [])
             
-            # Create a lookup dict by description and date for matching
             txn_lookup = {}
             for txn in transactions:
                 key = (txn.get('date'), txn.get('description'))
                 txn_lookup[key] = txn
             
-            # Add formatted amount column
             def format_row_amount(row):
                 key = (row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']), 
                        row['Description'])
@@ -1638,20 +1676,260 @@ def show_overview(df):
                 return format_amount_with_original(txn, row.get('Currency', 'ILS'))
             
             display_data['Amount'] = display_data.apply(format_row_amount, axis=1)
-            columns_to_show = ['Date', 'Description', 'Category', 'Amount']
         else:
-            # No original currency data, just format regular amount
             display_data['Amount'] = display_data.apply(
                 lambda row: format_currency_amount(row['Cost'], row.get('Currency', 'ILS')), 
                 axis=1
             )
-            columns_to_show = ['Date', 'Description', 'Category', 'Amount']
         
-        st.dataframe(
-            display_data[columns_to_show].sort_values('Date', ascending=False),
-            use_container_width=True,
-            hide_index=True
-        )
+        # Sort and paginate for performance
+        display_data = display_data.sort_values('Date', ascending=False)
+        
+        # Pagination controls
+        total_rows = len(display_data)
+        
+        col1, col2, col3 = st.columns([2, 2, 5])
+        
+        with col1:
+            rows_per_page = st.selectbox(
+                "Rows per page",
+                options=[10, 25, 50, 100],
+                index=0,  # Default to 10
+                key="rows_per_page",
+                help="⚡ Performance tip: Fewer rows per page = faster loading and smoother interaction"
+            )
+        
+        with col2:
+            total_pages = (total_rows + rows_per_page - 1) // rows_per_page
+            
+            if total_pages > 1:
+                # Create page options
+                page_options = []
+                for i in range(1, total_pages + 1):
+                    start = (i - 1) * rows_per_page + 1
+                    end = min(i * rows_per_page, total_rows)
+                    page_options.append(f"Page {i} ({start}-{end})")
+                
+                selected_page_str = st.selectbox(
+                    "Page",
+                    options=page_options,
+                    key="page_selector"
+                )
+                
+                # Extract page number from selection
+                page = int(selected_page_str.split()[1])
+            else:
+                page = 1
+                st.caption(f"All {total_rows} transactions")
+        
+        with col3:
+            if total_pages > 1:
+                start_idx = (page - 1) * rows_per_page + 1
+                end_idx = min(page * rows_per_page, total_rows)
+                st.caption(f"Showing {start_idx}-{end_idx} of {total_rows} transactions")
+        
+        # Apply pagination
+        start_idx = (page - 1) * rows_per_page
+        end_idx = start_idx + rows_per_page
+        display_data = display_data.iloc[start_idx:end_idx]
+        
+        # Display header row
+        st.markdown("---")
+        header_cols = st.columns([1.5, 3, 2, 1.5, 0.8, 2, 1])
+        header_cols[0].markdown("**Date**")
+        header_cols[1].markdown("**Description**")
+        header_cols[2].markdown("**Category**")
+        header_cols[3].markdown("**Amount**")
+        header_cols[4].markdown("**📝**")
+        header_cols[5].markdown("**Tags**")
+        header_cols[6].markdown("**Actions**")
+        st.markdown("---")
+        
+        # Display each transaction as a row with integrated buttons
+        for idx, row in display_data.iterrows():
+            transaction_id = row['transaction_id']
+            txn_metadata = metadata_mgr.get_transaction_metadata(transaction_id)
+            notes = txn_metadata.get('notes', '')
+            tags = txn_metadata.get('tags', [])
+            
+            date_str = row['Date'].strftime('%Y-%m-%d')
+            cost_str = format_currency_amount(row['Cost'], row.get('Currency', 'ILS'))
+            
+            # Get note indicator and tags display
+            note_icon = "📝" if notes.strip() else ""
+            tags_display = ", ".join(tags[:3]) if len(tags) <= 3 else f"{', '.join(tags[:3])} +{len(tags)-3}"
+            
+            # Create row with all columns (note: increased note column width to 0.8 from 0.5)
+            cols = st.columns([1.5, 3, 2, 1.5, 0.8, 2, 1])
+            
+            cols[0].text(date_str)
+            cols[1].text(row['Description'])
+            cols[2].text(row.get('Category', 'N/A'))
+            cols[3].text(cost_str)
+            
+            # Note icon with read-only popover
+            with cols[4]:
+                if notes.strip():
+                    with st.popover("📝", use_container_width=False):
+                        st.markdown("**📝 Note**")
+                        st.info(notes)
+                        st.caption("Use ✏️ to edit")
+                else:
+                    st.text("")
+            
+            cols[5].text(tags_display if tags_display else "")
+            
+            # Edit button with popover in the last column
+            with cols[6]:
+                with st.popover("✏️"):
+                    st.markdown(f"**{row['Description']}**")
+                    st.caption(f"{date_str} | {cost_str}")
+                    
+                    # Notes editor
+                    st.markdown("**📝 Notes:**")
+                    new_notes = st.text_area(
+                        "Add notes",
+                        value=notes,
+                        height=80,
+                        key=f"notes_{transaction_id}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    if new_notes != notes:
+                        if st.button("💾 Save Notes", key=f"save_notes_{transaction_id}", use_container_width=True):
+                            metadata_mgr.add_note(transaction_id, new_notes)
+                            metadata_mgr.clear_cache()
+                            st.success("Saved!")
+                            st.rerun()
+                    
+                    st.markdown("---")
+                    
+                    # Tags editor
+                    st.markdown("**🏷️ Tags:**")
+                    
+                    # Display current tags
+                    if tags:
+                        for tag in tags:
+                            tag_col1, tag_col2 = st.columns([3, 1])
+                            with tag_col1:
+                                st.markdown(f"`{tag}`")
+                            with tag_col2:
+                                if st.button("×", key=f"remove_{transaction_id}_{tag}"):
+                                    metadata_mgr.remove_tag(transaction_id, tag)
+                                    metadata_mgr.clear_cache()
+                                    st.rerun()
+                    else:
+                        st.caption("No tags yet")
+                    
+                    # Add new tag
+                    new_tag = st.text_input(
+                        "Add tag",
+                        key=f"new_tag_{transaction_id}",
+                        placeholder="vacation, medical..."
+                    )
+                    
+                    if new_tag and st.button("➕ Add", key=f"add_tag_{transaction_id}", use_container_width=True):
+                        metadata_mgr.add_tag(transaction_id, new_tag.strip().lower())
+                        metadata_mgr.clear_cache()
+                        st.rerun()
+                    
+                    # Popular tags
+                    if all_tags:
+                        st.markdown("**Quick add:**")
+                        popular = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+                        for tag, count in popular:
+                            if tag not in tags:
+                                if st.button(f"+ {tag}", key=f"quick_{transaction_id}_{tag}", use_container_width=True):
+                                    metadata_mgr.add_tag(transaction_id, tag)
+                                    metadata_mgr.clear_cache()
+                                    st.rerun()
+
+
+
+def show_tag_analytics(df):
+    """Show analytics based on tags"""
+    metadata_mgr = get_metadata_manager()
+    
+    # Get all tags and counts
+    tag_counts = metadata_mgr.get_tag_counts()
+    
+    if not tag_counts:
+        return  # No tags to show
+    
+    with st.expander("🏷️ Tag Analytics", expanded=False):
+        st.subheader("Spending by Tags")
+        
+        # Calculate spending per tag
+        tag_spending = {}
+        
+        for tag, count in tag_counts.items():
+            # Get transactions with this tag
+            txn_ids = metadata_mgr.get_transactions_by_tag(tag)
+            
+            # Calculate total spending for these transactions
+            df['transaction_id'] = df.apply(
+                lambda row: metadata_mgr.create_transaction_id(
+                    str(row['Date']), row['Description'], row['Cost']
+                ), axis=1
+            )
+            
+            tagged_df = df[df['transaction_id'].isin(txn_ids)]
+            total = tagged_df['Cost'].sum()
+            tag_spending[tag] = {
+                'count': count,
+                'total': total,
+                'avg': total / count if count > 0 else 0
+            }
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total Tags", len(tag_counts))
+        
+        with col2:
+            total_tagged = sum(data['count'] for data in tag_spending.values())
+            st.metric("Tagged Transactions", total_tagged)
+        
+        with col3:
+            total_tag_spending = sum(data['total'] for data in tag_spending.values())
+            st.metric("Tagged Spending", format_currency_amount(total_tag_spending, 'ILS'))
+        
+        # Pie chart of spending by tag
+        if tag_spending:
+            tag_df = pd.DataFrame([
+                {'Tag': tag, 'Spending': data['total'], 'Count': data['count']}
+                for tag, data in sorted(tag_spending.items(), key=lambda x: x[1]['total'], reverse=True)
+            ])
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_pie = px.pie(
+                    tag_df,
+                    values='Spending',
+                    names='Tag',
+                    title='Spending Distribution by Tag'
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with col2:
+                # Bar chart of transaction counts
+                fig_bar = px.bar(
+                    tag_df,
+                    x='Tag',
+                    y='Count',
+                    title='Transaction Count by Tag'
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+            
+            # Detailed table
+            st.markdown("### Tag Details")
+            display_df = tag_df.copy()
+            display_df['Average'] = display_df['Spending'] / display_df['Count']
+            display_df['Spending'] = display_df['Spending'].apply(lambda x: format_currency_amount(x, 'ILS'))
+            display_df['Average'] = display_df['Average'].apply(lambda x: format_currency_amount(x, 'ILS'))
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 def show_income_tracking():
     """Income tracking and savings page"""
@@ -1990,7 +2268,7 @@ def show_income_entry_modal(dm, edit_id=None):
 
 def show_combined_analytics():
     """Combined analytics across multiple groups"""
-    st.title("📊 Combined Groups Analytics")
+    st.title("📊 Cross-Group Analysis")
     
     groups_mgr = get_groups_manager()
     groups = groups_mgr.get_all_groups()
@@ -2448,7 +2726,7 @@ def show_combined_analytics():
 
 def show_manage_groups_page():
     """Manage groups page"""
-    st.title("⚙️ Manage Groups")
+    st.title("⚙️ Groups")
     
     groups_mgr = get_groups_manager()
     groups = groups_mgr.get_all_groups()
@@ -2545,12 +2823,6 @@ def show_manage_groups_page():
             
             with col2:
                 is_active = group['id'] == groups_mgr.get_active_group()['id']
-                
-                if st.button("👁️ View", key=f"view_{group['id']}", use_container_width=True, disabled=is_active):
-                    groups_mgr.set_active_group(group['id'])
-                    st.cache_data.clear()
-                    st.session_state.navigate_to_overview = True
-                    st.rerun()
                 
                 if st.button("✏️ Edit", key=f"edit_{group['id']}", use_container_width=True):
                     st.session_state.editing_group_id = group['id']
@@ -3060,7 +3332,7 @@ def show_currency_settings():
 
 def show_multi_currency_analytics():
     """Show dedicated multi-currency analytics page with trends and insights"""
-    st.header("💱 Multi-Currency Analytics")
+    st.header("💱 Currency Analysis")
     
     currency_mgr = get_currency_manager()
     
@@ -3464,7 +3736,7 @@ def show_multi_currency_analytics():
 
 def show_analytics(df):
     """Show analytics page with detailed charts"""
-    st.header("📊 Analytics")
+    st.header("📊 Expense Breakdown")
     
     df_all_expenses = exclude_payments_and_reimbursements(df)
     
@@ -3905,18 +4177,19 @@ def main():
     df = load_persisted_data()
     
     # Navigation
+    st.sidebar.markdown("---")
     st.sidebar.header("📊 Navigation")
     
     # Handle navigation from Manage button or restore after group switch
     if st.session_state.navigate_to_manage_groups:
-        default_page = "Manage Groups"
+        default_page = "Groups"
         # Clear the flag AFTER using it
     elif 'current_page' in st.session_state:
         default_page = st.session_state.current_page
     else:
         default_page = "Overview"
     
-    page_options = ["Overview", "Analytics", "Income & Savings", "Data Management", "Currency Settings", "Multi-Currency Analytics", "Combined Analytics", "Manage Groups"]
+    page_options = ["Overview", "Expense Breakdown", "Currency Analysis", "Cross-Group Analysis", "Income & Savings", "Groups", "Currency Settings", "Data & Backups"]
     page = st.sidebar.radio("Select Page", page_options, 
                            index=page_options.index(default_page) if default_page in page_options else 0,
                            key="main_page_selector")
@@ -3930,7 +4203,8 @@ def main():
         st.session_state.current_page = page
     
     # Filters (if not on data management or income page)
-    if page not in ["Data Management", "Income & Savings", "Currency Settings", "Multi-Currency Analytics", "Combined Analytics", "Manage Groups"] and not df.empty:
+    if page not in ["Data & Backups", "Income & Savings", "Currency Settings", "Currency Analysis", "Cross-Group Analysis", "Groups"] and not df.empty:
+        st.sidebar.markdown("---")
         st.sidebar.header("🔍 Filters")
         
         # Date range filter
@@ -3950,29 +4224,71 @@ def main():
                 (df['Date'].dt.date >= date_range[0]) &
                 (df['Date'].dt.date <= date_range[1])
             ]
+        
+        # Tag filter (only on Overview page where transactions are shown)
+        if page == "Overview":
+            metadata_mgr = get_metadata_manager()
+            all_tags = sorted(metadata_mgr.get_all_tags())
+            tag_counts = metadata_mgr.get_tag_counts()
+            
+            if all_tags:
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("🏷️ Filter by Tags")
+                
+                for tag in all_tags:
+                    count = tag_counts.get(tag, 0)
+                    st.sidebar.checkbox(f"{tag} ({count})", key=f"tag_filter_{tag}")
+            elif page == "Overview":
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("🏷️ Filter by Tags")
+                st.sidebar.info("No tags yet!")
+    
+    # Dashboard Currency (at bottom)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💱 Dashboard Currency")
+    
+    # Get dashboard-wide target currency from CurrencyManager
+    currency_mgr = get_currency_manager()
+    target_currency = currency_mgr.get_target_currency()
+    
+    if target_currency:
+        # Show target currency with symbol
+        symbol = get_currency_symbol(target_currency)
+        currency_name = get_currency_name(target_currency)
+        
+        st.sidebar.info(f"""**{target_currency} {symbol}**  
+{currency_name}
+
+ℹ️ All amounts displayed in this currency  
+💡 Change via Data & Backups → Database Import""")
+    else:
+        # Dashboard not initialized yet
+        st.sidebar.warning("""⚠️ **Currency Not Set**
+
+Import your first Splitwise file to set up your dashboard currency.""")
     
     # Show selected page
     if page == "Overview":
         if not df.empty:
             show_overview(df)
         else:
-            st.info("No data available. Go to Data Management to import data.")
-    elif page == "Analytics":
+            st.info("No data available. Go to Data & Backups to import data.")
+    elif page == "Expense Breakdown":
         if not df.empty:
             show_analytics(df)
         else:
-            st.info("No data available. Go to Data Management to import data.")
+            st.info("No data available. Go to Data & Backups to import data.")
     elif page == "Income & Savings":
         show_income_tracking()
-    elif page == "Data Management":
+    elif page == "Data & Backups":
         show_data_management()
     elif page == "Currency Settings":
         show_currency_settings()
-    elif page == "Multi-Currency Analytics":
+    elif page == "Currency Analysis":
         show_multi_currency_analytics()
-    elif page == "Combined Analytics":
+    elif page == "Cross-Group Analysis":
         show_combined_analytics()
-    elif page == "Manage Groups":
+    elif page == "Groups":
         show_manage_groups_page()
 
 if __name__ == "__main__":
