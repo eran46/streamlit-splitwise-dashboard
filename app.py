@@ -12,6 +12,7 @@ from groups_manager import GroupsManager
 from user_expense_calculator import UserExpenseCalculator
 from currency_manager import CurrencyManager, get_currency_symbol, format_currency_amount, get_currency_name
 from exchange_rate_manager import ExchangeRateManager
+from database_migrations.migration_manager import MigrationManager
 
 # Page configuration
 st.set_page_config(
@@ -1620,7 +1621,8 @@ def show_overview(df):
         if 'original_cost' in display_data.columns and 'original_currency' in display_data.columns:
             # Convert to dict records for easier processing
             dm = get_data_manager()
-            transactions = dm.load_transactions()
+            data = dm.load_data()
+            transactions = data.get('transactions', [])
             
             # Create a lookup dict by description and date for matching
             txn_lookup = {}
@@ -2878,7 +2880,7 @@ def show_currency_settings():
     st.markdown("Configure automatic exchange rate updates for your dashboard.")
     
     # Load current settings
-    settings = currency_mgr.get_all_settings()
+    settings = currency_mgr.load_settings()
     auto_update_enabled = settings.get('dashboard_settings', {}).get('auto_update', False)
     api_service = settings.get('dashboard_settings', {}).get('api_service', 'exchangerate-api.com')
     api_key = settings.get('dashboard_settings', {}).get('api_key', '')
@@ -3762,6 +3764,102 @@ def show_analytics(df):
     else:
         st.info("No data available for the selected category")
 
+def run_database_migrations():
+    """Check and run database migrations on app startup"""
+    # Check if we've already run migrations this session
+    if 'migrations_checked' not in st.session_state:
+        st.session_state.migrations_checked = False
+    
+    if st.session_state.migrations_checked:
+        return  # Already checked this session
+    
+    try:
+        # Initialize migration manager
+        migration_mgr = MigrationManager(user_data_path="user_data")
+        
+        # Check if migrations are needed
+        needs_migration = migration_mgr.check_migrations_needed()
+        
+        if not needs_migration:
+            # No migrations needed
+            st.session_state.migrations_checked = True
+            return
+        
+        # Show migration dialog
+        st.warning("🔄 Database migrations are required to add new features!")
+        
+        total_files = len(needs_migration)
+        st.info(f"📊 {total_files} file(s) need to be updated")
+        
+        # Show what will be migrated
+        with st.expander("📋 View migration details", expanded=True):
+            for file_path, migrations in needs_migration.items():
+                file_name = file_path.split('/')[-2]  # Get group name
+                st.write(f"**{file_name}**")
+                for migration_name in migrations:
+                    migration_obj = migration_mgr.migrations.get(migration_name)
+                    if migration_obj:
+                        st.write(f"  • {migration_obj}")
+        
+        st.markdown("---")
+        st.markdown("### 🛡️ Safety Features")
+        st.write("✅ Automatic backups created before migration")
+        st.write("✅ Automatic rollback if any errors occur")
+        st.write("✅ All data validated before and after migration")
+        
+        st.markdown("---")
+        
+        # Migration button
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("🚀 Run Migrations Now", type="primary", use_container_width=True):
+                # Create progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                status_text.text("🔄 Running migrations...")
+                
+                # Run migrations
+                results = migration_mgr.run_all_migrations(show_progress=False)
+                
+                # Update progress
+                successful = sum(1 for v in results.values() if v)
+                progress_bar.progress(successful / total_files)
+                
+                # Show results
+                if successful == total_files:
+                    status_text.empty()
+                    progress_bar.empty()
+                    st.success(f"✅ Successfully migrated {successful}/{total_files} files!")
+                    st.balloons()
+                    
+                    # Mark migrations as checked
+                    st.session_state.migrations_checked = True
+                    
+                    # Force refresh after 2 seconds
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    failed = total_files - successful
+                    st.error(f"❌ Migration failed for {failed} file(s)")
+                    st.warning("Your data has been preserved. Please check the error messages above.")
+        
+        # Skip button (not recommended)
+        st.markdown("---")
+        with st.expander("⚠️ Skip migrations (not recommended)"):
+            st.warning("Skipping migrations may cause features to not work correctly.")
+            if st.button("Skip for now"):
+                st.session_state.migrations_checked = True
+                st.rerun()
+        
+        # Stop execution until migration is complete
+        st.stop()
+        
+    except Exception as e:
+        st.error(f"❌ Error checking migrations: {e}")
+        # Allow continuing on error
+        st.session_state.migrations_checked = True
+
 def main():
     st.title("💰 streamlit-splitwise-dashboard")
     
@@ -3772,6 +3870,9 @@ def main():
         st.session_state.show_manage_groups = False
     if 'navigate_to_manage_groups' not in st.session_state:
         st.session_state.navigate_to_manage_groups = False
+    
+    # Run database migrations if needed
+    run_database_migrations()
     
     # Check if groups need to be migrated
     groups_mgr = get_groups_manager()

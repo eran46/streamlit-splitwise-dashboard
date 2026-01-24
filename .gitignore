@@ -4,3 +4,5 @@ user_data/
 __pycache__/
 *.pyc
 /tests
+/database_migrations/tests
+feature_plan.md
