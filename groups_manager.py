@@ -127,6 +127,11 @@ class GroupsManager:
         """Create new expense group"""
         config = self._load_config()
         
+        # Check for duplicate names
+        existing_names = [g['name'] for g in config.get('groups', [])]
+        if name in existing_names:
+            raise ValueError(f"Group with name '{name}' already exists. Please choose a different name.")
+        
         # Generate unique ID
         group_id = f"group_{uuid.uuid4().hex[:8]}"
         

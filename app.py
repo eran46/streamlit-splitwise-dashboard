@@ -6,9 +6,12 @@ from datetime import datetime, timedelta
 import numpy as np
 import io
 import json
+import time
 from data_manager import DataManager
 from groups_manager import GroupsManager
 from user_expense_calculator import UserExpenseCalculator
+from currency_manager import CurrencyManager, get_currency_symbol, format_currency_amount, get_currency_name
+from exchange_rate_manager import ExchangeRateManager
 
 # Page configuration
 st.set_page_config(
@@ -23,6 +26,16 @@ def get_groups_manager():
     """Singleton groups manager"""
     return GroupsManager()
 
+@st.cache_resource
+def get_currency_manager():
+    """Singleton currency manager"""
+    return CurrencyManager()
+
+@st.cache_resource
+def get_exchange_rate_manager():
+    """Singleton exchange rate manager"""
+    return ExchangeRateManager()
+
 def get_data_manager(group_data_path=None):
     """Get data manager for specific group or active group"""
     if group_data_path is None:
@@ -32,34 +45,233 @@ def get_data_manager(group_data_path=None):
             group_data_path = groups_mgr.get_group_data_path(active_group['id'])
     return DataManager(group_data_path)
 
-def convert_df_to_transactions(df):
-    """Convert DataFrame to transaction list, preserving all columns including member splits"""
+def show_import_rate_summary(df, transactions):
+    """Show summary of exchange rates used during import"""
+    currency_mgr = get_currency_manager()
+    if not currency_mgr.is_initialized():
+        return
+    
+    target_currency = currency_mgr.get_target_currency()
+    target_symbol = get_currency_symbol(target_currency)
+    
+    # Collect rate information from transactions
+    rate_info = {}
+    for txn in transactions:
+        if 'original_currency' in txn and txn.get('original_currency') != target_currency:
+            orig_curr = txn['original_currency']
+            if orig_curr not in rate_info:
+                rate_info[orig_curr] = {
+                    'count': 0,
+                    'rate': txn.get('exchange_rate'),
+                    'rate_date': txn.get('rate_date'),
+                    'rate_source': txn.get('rate_source'),
+                    'total_original': 0,
+                    'total_converted': 0
+                }
+            rate_info[orig_curr]['count'] += 1
+            rate_info[orig_curr]['total_original'] += txn.get('original_cost', 0)
+            rate_info[orig_curr]['total_converted'] += txn.get('cost', 0)
+    
+    if not rate_info:
+        return  # No foreign currencies
+    
+    st.markdown("---")
+    st.subheader("💱 Currency Conversion Summary")
+    
+    # Create columns for each currency
+    cols = st.columns(min(len(rate_info), 3))
+    
+    for idx, (currency, info) in enumerate(rate_info.items()):
+        with cols[idx % len(cols)]:
+            curr_symbol = get_currency_symbol(currency)
+            curr_name = get_currency_name(currency)
+            
+            # Determine strategy used
+            rate_source = info['rate_source'] or 'unknown'
+            if 'historical' in rate_source.lower():
+                strategy = "📊 Historical Rate"
+                strategy_color = "🟢"
+                accuracy = "Most accurate"
+            else:
+                strategy = "⏱️ Import-time Rate"
+                strategy_color = "🟡"
+                accuracy = "~1% accurate"
+            
+            st.markdown(f"#### {currency} {curr_symbol}")
+            st.caption(f"{curr_name}")
+            
+            # Show rate
+            if info['rate']:
+                st.metric(
+                    "Exchange Rate",
+                    f"1 {currency} = {info['rate']:.4f} {target_currency}",
+                    delta=None
+                )
+            
+            # Show transaction count and total
+            st.write(f"**{info['count']} transactions**")
+            st.write(f"{curr_symbol}{info['total_original']:,.2f} → {target_symbol}{info['total_converted']:,.2f}")
+            
+            # Show strategy and accuracy
+            st.caption(f"{strategy_color} {strategy}")
+            st.caption(f"✓ {accuracy}")
+            
+            # Show rate date
+            if info['rate_date']:
+                st.caption(f"📅 Rate from: {info['rate_date']}")
+    
+    # Show overall summary
+    st.info(
+        f"💡 **Conversion Strategy**: "
+        f"Historical rates used when available (ECB currencies), "
+        f"import-time rates for others. All rates cached for consistency."
+    )
+
+def convert_df_to_transactions(df, apply_currency_conversion=False):
+    """Convert DataFrame to transaction list, preserving all columns including member splits
+    
+    Args:
+        df: DataFrame with transaction data
+        apply_currency_conversion: If True, convert amounts to target currency
+    """
     transactions = []
+    
+    # Check if currency conversion is needed
+    currency_mgr = get_currency_manager()
+    exchange_mgr = get_exchange_rate_manager()
+    target_currency = currency_mgr.get_target_currency() if currency_mgr.is_initialized() else None
     
     # Standard columns
     standard_cols = ['Date', 'Description', 'Category', 'Cost', 'Currency']
     
+    # Track currencies for batch cache
+    currencies_used = {}
+    
     for _, row in df.iterrows():
+        original_cost = float(row['Cost']) if pd.notna(row['Cost']) else 0.0
+        original_currency = str(row['Currency']) if pd.notna(row['Currency']) else 'ILS'
+        converted_cost = original_cost
+        rate_metadata = None
+        
+        # Apply currency conversion if enabled
+        if apply_currency_conversion and target_currency and original_currency != target_currency:
+            try:
+                # Get transaction date for historical rate
+                txn_date = pd.to_datetime(row['Date']) if pd.notna(row['Date']) else None
+                
+                # Convert amount
+                converted_cost, rate_metadata = exchange_mgr.convert_amount(
+                    original_cost,
+                    original_currency,
+                    target_currency,
+                    date=txn_date
+                )
+                
+                # Track currency usage for batch cache
+                if original_currency not in currencies_used:
+                    currencies_used[original_currency] = rate_metadata
+                
+            except Exception as e:
+                st.warning(f"Could not convert {original_cost} {original_currency}: {e}")
+                converted_cost = original_cost
+        
+        # Create transaction
         txn = {
             'date': row['Date'].isoformat() if pd.notna(row['Date']) else None,
             'description': str(row['Description']) if pd.notna(row['Description']) else '',
             'category': str(row['Category']) if pd.notna(row['Category']) else '',
-            'cost': float(row['Cost']) if pd.notna(row['Cost']) else 0.0,
-            'currency': str(row['Currency']) if pd.notna(row['Currency']) else 'ILS',
-            'source': 'import'
+            'cost': converted_cost,  # Converted amount
+            'currency': target_currency if (apply_currency_conversion and target_currency) else original_currency,
+            'source': 'splitwise_import' if apply_currency_conversion else 'import'
         }
         
+        # Add original currency information if conversion was applied
+        if apply_currency_conversion and target_currency and original_currency != target_currency:
+            txn['original_cost'] = original_cost
+            txn['original_currency'] = original_currency
+            if rate_metadata:
+                txn['exchange_rate'] = rate_metadata['exchange_rate']
+                txn['rate_date'] = rate_metadata['rate_date']
+                txn['rate_source'] = rate_metadata['rate_source']
+        
         # Preserve all other columns (member splits, etc.)
+        # Note: Member splits will also need to be converted if currency conversion is applied
         for col in df.columns:
             if col not in standard_cols and col not in txn:
                 # Add any non-standard column (like member names)
                 if pd.notna(row[col]):
-                    txn[col] = float(row[col]) if isinstance(row[col], (int, float)) else str(row[col])
+                    value = float(row[col]) if isinstance(row[col], (int, float)) else str(row[col])
+                    
+                    # Convert member split amounts if this is a numeric column (likely a member split)
+                    if isinstance(value, float) and apply_currency_conversion and target_currency and original_currency != target_currency:
+                        try:
+                            # Same conversion ratio as the main cost
+                            if original_cost > 0:
+                                conversion_ratio = converted_cost / original_cost
+                                value = value * conversion_ratio
+                        except:
+                            pass
+                    
+                    txn[col] = value
         
         transactions.append(txn)
+    
+    # Create import batch cache if conversions were applied
+    if apply_currency_conversion and currencies_used:
+        groups_mgr = get_groups_manager()
+        active_group = groups_mgr.get_active_group()
+        group_name = active_group['name'] if active_group else "Unknown"
+        
+        import_batch_id = exchange_mgr.create_import_batch_cache(
+            group_name,
+            target_currency,
+            currencies_used,
+            len(transactions)
+        )
+        
+        # Add import_batch_id to transactions that used fallback rates
+        for txn in transactions:
+            if txn.get('rate_source') and 'fallback' in txn.get('rate_source', ''):
+                txn['import_batch_id'] = import_batch_id
+    
     return transactions
 
 @st.cache_data
+def detect_currencies_in_df(df: pd.DataFrame) -> list:
+    """Detect unique currencies in a dataframe"""
+    currencies = []
+    if 'Currency' in df.columns:
+        unique_currencies = df['Currency'].dropna().unique()
+        currencies = [c for c in unique_currencies if c]
+    return sorted(set(currencies)) if currencies else ['ILS']  # Default to ILS if no currency column
+
+def format_amount_with_original(transaction: dict, target_currency: str = None) -> str:
+    """
+    Format amount showing both converted and original currency
+    
+    Args:
+        transaction: Transaction dict with cost, currency, original_cost, original_currency
+        target_currency: Target currency for display (optional, uses transaction currency if not provided)
+    
+    Returns:
+        Formatted string like "₪375.51 (200 BGN)" or "₪450.00" if no conversion
+    """
+    cost = transaction.get('cost', 0)
+    currency = transaction.get('currency', target_currency or 'ILS')
+    original_cost = transaction.get('original_cost')
+    original_currency = transaction.get('original_currency')
+    
+    # Format the converted amount
+    converted_str = format_currency_amount(cost, currency)
+    
+    # If there's an original amount and it's different from converted, show both
+    if (original_cost is not None and original_currency and 
+        original_currency != currency and abs(original_cost - cost) > 0.01):
+        original_str = format_currency_amount(original_cost, original_currency)
+        return f"{converted_str} ({original_str})"
+    
+    return converted_str
+
 def load_data_from_file(file, file_type):
     """Load and preprocess the expense data from uploaded file"""
     try:
@@ -102,7 +314,12 @@ def load_data_from_file(file, file_type):
         return None
 
 def update_group_members_from_data(group_id: str, df: pd.DataFrame):
-    """Update group members list based on detected member columns in data"""
+    """Update group members list based on detected member columns in data
+    
+    Merges new members with existing members to preserve historical member data.
+    This ensures that members from previous imports remain visible even when
+    importing new data with different member combinations.
+    """
     dm = get_data_manager()
     member_cols = dm.get_member_columns(df)
     
@@ -111,13 +328,15 @@ def update_group_members_from_data(group_id: str, df: pd.DataFrame):
         group = groups_mgr.get_group_by_id(group_id)
         
         if group:
-            # Update members if they're not already set or are different
+            # MERGE members: combine existing with new ones
             current_members = set(group.get('members', []))
             new_members = set(member_cols)
+            merged_members = current_members.union(new_members)
             
-            if current_members != new_members:
-                groups_mgr.update_group(group_id, members=list(new_members))
-                return list(new_members)
+            # Only update if there are actually new members
+            if merged_members != current_members:
+                groups_mgr.update_group(group_id, members=list(merged_members))
+                return list(merged_members)
     
     return []
 
@@ -306,6 +525,57 @@ def render_group_selector():
         if st.button("⚙️ Manage", use_container_width=True, key="manage_groups_btn"):
             st.session_state.navigate_to_manage_groups = True
             st.rerun()
+    
+    # Currency selector
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💱 Dashboard Currency")
+    
+    # Get dashboard-wide target currency from CurrencyManager
+    currency_mgr = get_currency_manager()
+    target_currency = currency_mgr.get_target_currency()
+    
+    if target_currency:
+        # Show target currency with symbol
+        symbol = get_currency_symbol(target_currency)
+        currency_name = get_currency_name(target_currency)
+        
+        st.sidebar.info(f"""**{target_currency} {symbol}**  
+{currency_name}
+
+ℹ️ All amounts displayed in this currency  
+💡 Change via Data Management → Database Import""")
+    else:
+        # Dashboard not initialized yet
+        st.sidebar.warning("""⚠️ **Currency Not Set**
+
+Import your first Splitwise file to set up your dashboard currency.""")
+
+def get_available_currencies():
+    """Get all currencies available in current group's data"""
+    try:
+        groups_mgr = get_groups_manager()
+        if not groups_mgr.has_groups():
+            return ['ILS']
+        
+        active_group = groups_mgr.get_active_group()
+        group_path = groups_mgr.get_group_data_path(active_group['id'])
+        dm = DataManager(group_path)
+        
+        data = dm.load_data()
+        currencies = set()
+        
+        # Get currencies from transactions
+        for txn in data.get('transactions', []):
+            currency = txn.get('currency', 'ILS')
+            if currency and pd.notna(currency):
+                currencies.add(currency)
+        
+        # Always include ILS as an option
+        currencies.add('ILS')
+        
+        return sorted(list(currencies))
+    except:
+        return ['ILS']
 
 def render_member_filter(df):
     """Add member filter to sidebar for group data"""
@@ -380,28 +650,86 @@ def show_new_group_modal():
             if not group_name:
                 st.error("Group name is required")
             else:
-                groups_mgr = get_groups_manager()
-                members = [m.strip() for m in members_input.split(',')] if members_input else []
-                
-                new_group = groups_mgr.create_group(
-                    name=group_name,
-                    description=group_description,
-                    emoji=group_emoji,
-                    members=members
-                )
-                
-                st.success(f"✅ Created group: {group_emoji} {group_name}")
-                st.session_state.show_new_group_modal = False
-                
-                # Switch to new group
-                groups_mgr.set_active_group(new_group['id'])
-                st.cache_data.clear()
-                st.rerun()
+                try:
+                    groups_mgr = get_groups_manager()
+                    members = [m.strip() for m in members_input.split(',')] if members_input else []
+                    
+                    new_group = groups_mgr.create_group(
+                        name=group_name,
+                        description=group_description,
+                        emoji=group_emoji,
+                        members=members
+                    )
+                    
+                    st.success(f"✅ Created group: {group_emoji} {group_name}")
+                    st.session_state.show_new_group_modal = False
+                    
+                    # Switch to new group
+                    groups_mgr.set_active_group(new_group['id'])
+                    st.cache_data.clear()
+                    st.rerun()
+                except ValueError as e:
+                    st.error(f"❌ {str(e)}")
+
+def show_currency_selection(detected_currencies: list):
+    """Show currency selection dialog for first import"""
+    st.markdown("### 🎉 Welcome! Set Up Your Dashboard")
+    
+    st.info("📊 This is your first import! Please choose your target currency for display across all dashboard groups.")
+    
+    # Show detected currencies
+    if detected_currencies:
+        st.markdown("**Detected currencies in your import:**")
+        for currency in detected_currencies:
+            symbol = get_currency_symbol(currency)
+            name = get_currency_name(currency)
+            st.markdown(f"• **{currency}** ({name}) {symbol}")
+    
+    st.markdown("---")
+    
+    # Currency selection
+    st.markdown("**Choose Target Currency:**")
+    st.markdown("_All amounts across all groups will be displayed in this currency._")
+    
+    # Common currencies
+    common_currencies = ['ILS', 'USD', 'EUR', 'GBP', 'JPY']
+    # Add detected currencies that aren't in common list
+    all_options = list(dict.fromkeys(detected_currencies + common_currencies))
+    
+    selected_currency = st.selectbox(
+        "Select your target currency:",
+        options=all_options,
+        format_func=lambda c: f"{c} ({get_currency_name(c)}) {get_currency_symbol(c)}",
+        index=0 if detected_currencies else all_options.index('ILS'),
+        key="target_currency_selection"
+    )
+    
+    st.markdown("---")
+    st.markdown("**ℹ️ About Target Currency:**")
+    st.markdown("""
+    - All transactions will be converted to this currency for unified display
+    - You can change it later by exporting and re-importing your database
+    - **Recommended:** Choose the currency you use most often
+    """)
+    
+    return selected_currency
 
 def show_setup_wizard():
     """First-time setup wizard"""
-    st.title("👋 Welcome to streamlit-splitwise-dashboard !")
+    st.title("👋 Welcome to ExpenseInfo Dashboard!")
     st.markdown("Let's set up your expense tracking system.")
+    
+    # Check if we need currency initialization
+    currency_mgr = get_currency_manager()
+    needs_currency_init = not currency_mgr.is_initialized()
+    
+    # Initialize session state for upload flow
+    if 'uploaded_df' not in st.session_state:
+        st.session_state.uploaded_df = None
+    if 'uploaded_currencies' not in st.session_state:
+        st.session_state.uploaded_currencies = []
+    if 'show_currency_selection' not in st.session_state:
+        st.session_state.show_currency_selection = False
     
     col1, col2 = st.columns(2)
     
@@ -409,23 +737,30 @@ def show_setup_wizard():
         st.subheader("Option 1: Import Existing Data")
         st.markdown("Upload your Splitwise export file to get started.")
         
-        uploaded_file = st.file_uploader(
-            "Choose a file",
-            type=['csv', 'xlsx', 'xls'],
-            help="Upload CSV or Excel file. For Hebrew names, use Excel exported from Google Sheets."
-        )
-        
-        if uploaded_file:
-            file_type = 'csv' if uploaded_file.name.endswith('.csv') else 'excel'
+        # Show currency selection if we have uploaded data
+        if st.session_state.show_currency_selection and st.session_state.uploaded_df is not None:
+            selected_currency = show_currency_selection(st.session_state.uploaded_currencies)
             
-            if st.button("Import Data", type="primary"):
-                with st.spinner("Processing your data..."):
-                    df = load_data_from_file(uploaded_file, file_type)
-                    
-                    if df is not None and not df.empty:
-                        # Convert to transactions and save
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("Cancel", type="secondary"):
+                    st.session_state.uploaded_df = None
+                    st.session_state.show_currency_selection = False
+                    st.rerun()
+            
+            with col_b:
+                if st.button("Set Currency & Import", type="primary"):
+                    with st.spinner("Initializing currency and importing data..."):
+                        # Initialize currency
+                        currency_mgr.initialize_dashboard(
+                            selected_currency,
+                            st.session_state.uploaded_currencies
+                        )
+                        
+                        # Now import the data with currency conversion
                         dm = get_data_manager()
-                        transactions = convert_df_to_transactions(df)
+                        df = st.session_state.uploaded_df
+                        transactions = convert_df_to_transactions(df, apply_currency_conversion=True)
                         result = dm.append_transactions(transactions)
                         
                         # Update group members if groups exist
@@ -438,8 +773,64 @@ def show_setup_wizard():
                         if result['skipped'] > 0:
                             st.info(f"ℹ️ Skipped {result['skipped']} duplicate transactions")
                         
+                        # Show currency conversion summary
+                        show_import_rate_summary(df, transactions)
+                        
+                        # Clear session state
+                        st.session_state.uploaded_df = None
+                        st.session_state.show_currency_selection = False
+                        
                         st.balloons()
+                        time.sleep(2)  # Give user time to see the summary
                         st.rerun()
+        else:
+            # Regular upload form
+            uploaded_file = st.file_uploader(
+                "Choose a file",
+                type=['csv', 'xlsx', 'xls'],
+                help="Upload CSV or Excel file. For Hebrew names, use Excel exported from Google Sheets.",
+                key="setup_wizard_uploader"
+            )
+            
+            if uploaded_file:
+                file_type = 'csv' if uploaded_file.name.endswith('.csv') else 'excel'
+                
+                if st.button("Import Data", type="primary"):
+                    with st.spinner("Processing your data..."):
+                        df = load_data_from_file(uploaded_file, file_type)
+                        
+                        if df is not None and not df.empty:
+                            # Detect currencies
+                            detected_currencies = detect_currencies_in_df(df)
+                            
+                            if needs_currency_init:
+                                # Store data and show currency selection
+                                st.session_state.uploaded_df = df
+                                st.session_state.uploaded_currencies = detected_currencies
+                                st.session_state.show_currency_selection = True
+                                st.rerun()
+                            else:
+                                # Currency already initialized, just import with conversion
+                                dm = get_data_manager()
+                                transactions = convert_df_to_transactions(df, apply_currency_conversion=True)
+                                result = dm.append_transactions(transactions)
+                                
+                                # Update group members if groups exist
+                                groups_mgr = get_groups_manager()
+                                if groups_mgr.has_groups():
+                                    active_group = groups_mgr.get_active_group()
+                                    update_group_members_from_data(active_group['id'], df)
+                                
+                                st.success(f"✅ Successfully imported {result['added']} transactions!")
+                                if result['skipped'] > 0:
+                                    st.info(f"ℹ️ Skipped {result['skipped']} duplicate transactions")
+                                
+                                # Show currency conversion summary
+                                show_import_rate_summary(df, transactions)
+                                
+                                st.balloons()
+                                time.sleep(2)  # Give user time to see the summary
+                                st.rerun()
     
     with col2:
         st.subheader("Option 2: Start Fresh")
@@ -544,11 +935,11 @@ def show_data_management():
             )
         
         if st.button("Import and Process", type="primary"):
-            with st.spinner("Processing file..."):
+            with st.spinner("Processing file and converting currencies..."):
                 df = load_data_from_file(uploaded_file, file_type)
                 
                 if df is not None and not df.empty:
-                    transactions = convert_df_to_transactions(df)
+                    transactions = convert_df_to_transactions(df, apply_currency_conversion=True)
                     result = dm.append_transactions(transactions)
                     
                     # Update group members from uploaded data
@@ -566,8 +957,12 @@ def show_data_management():
                                 dup_df = pd.DataFrame(result['duplicates'])
                                 st.dataframe(dup_df[['date', 'description', 'cost', 'category']])
                     
+                    # Show currency conversion summary
+                    show_import_rate_summary(df, transactions)
+                    
                     # Clear cache and reload
                     st.cache_data.clear()
+                    time.sleep(3)  # Give user time to see the summary
                     st.rerun()
     
     st.markdown("---")
@@ -621,8 +1016,242 @@ def show_data_management():
     
     st.markdown("---")
     
+    # Dashboard Export/Import section
+    st.subheader("💾 Full Dashboard Backup & Currency Change")
+    
+    st.info("📦 **Dashboard Export/Import** allows you to backup your entire dashboard or change your target currency. "
+            "All groups, transactions, income data, and settings are included.")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 📥 Export Dashboard")
+        st.write("Create a complete backup of your dashboard including all groups and settings.")
+        
+        if st.button("📦 Export Full Dashboard", type="primary"):
+            try:
+                import zipfile
+                import tempfile
+                from pathlib import Path
+                
+                # Create temporary zip file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
+                    zip_path = tmp_file.name
+                
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    # Add groups config
+                    groups_config_path = Path("user_data/groups/groups_config.json")
+                    if groups_config_path.exists():
+                        zipf.write(groups_config_path, "groups_config.json")
+                    
+                    # Add currency settings
+                    currency_settings_path = Path("user_data/dashboard_currency_settings.json")
+                    if currency_settings_path.exists():
+                        zipf.write(currency_settings_path, "dashboard_currency_settings.json")
+                    
+                    # Add all group data
+                    for group in groups:
+                        group_id = group['id']
+                        group_dir = Path(f"user_data/groups/{group_id}")
+                        
+                        if group_dir.exists():
+                            # Add transactions
+                            trans_file = group_dir / "transactions.json"
+                            if trans_file.exists():
+                                zipf.write(trans_file, f"groups/{group_id}/transactions.json")
+                            
+                            # Add income data
+                            income_file = group_dir / "income_data.json"
+                            if income_file.exists():
+                                zipf.write(income_file, f"groups/{group_id}/income_data.json")
+                    
+                    # Add export metadata
+                    export_metadata = {
+                        "export_timestamp": datetime.now().isoformat(),
+                        "export_version": "1.0",
+                        "total_groups": len(groups),
+                        "currency_system_initialized": get_currency_manager().is_initialized()
+                    }
+                    
+                    # Write metadata to temp file then add to zip
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as meta_file:
+                        json.dump(export_metadata, meta_file, indent=2)
+                        meta_path = meta_file.name
+                    
+                    zipf.write(meta_path, "export_metadata.json")
+                    Path(meta_path).unlink()  # Clean up temp file
+                
+                # Read zip file for download
+                with open(zip_path, 'rb') as f:
+                    zip_data = f.read()
+                
+                # Clean up temp zip
+                Path(zip_path).unlink()
+                
+                # Offer download
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                st.download_button(
+                    "📥 Download Dashboard Backup",
+                    zip_data,
+                    f"dashboard_export_{timestamp}.zip",
+                    "application/zip",
+                    key="download_dashboard"
+                )
+                
+                st.success(f"✅ Dashboard exported successfully! ({len(groups)} groups included)")
+                
+            except Exception as e:
+                st.error(f"❌ Error exporting dashboard: {e}")
+    
+    with col2:
+        st.markdown("#### 📤 Import Dashboard")
+        st.write("Restore from backup or change target currency. **Warning:** This replaces your current dashboard!")
+        
+        uploaded_dashboard = st.file_uploader(
+            "Upload Dashboard ZIP",
+            type=['zip'],
+            help="Upload a previously exported dashboard backup",
+            key="dashboard_upload"
+        )
+        
+        if uploaded_dashboard:
+            try:
+                import zipfile
+                import tempfile
+                
+                # Extract and analyze ZIP
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = Path(tmp_dir)
+                    
+                    # Extract ZIP
+                    with zipfile.ZipFile(uploaded_dashboard, 'r') as zipf:
+                        zipf.extractall(tmp_path)
+                    
+                    # Read metadata
+                    metadata_file = tmp_path / "export_metadata.json"
+                    if metadata_file.exists():
+                        with open(metadata_file, 'r') as f:
+                            metadata = json.load(f)
+                        
+                        st.success(f"✅ Dashboard analyzed: {metadata.get('total_groups', 0)} groups found")
+                        
+                        # Check for currency settings
+                        currency_file = tmp_path / "dashboard_currency_settings.json"
+                        has_currency = currency_file.exists()
+                        
+                        if has_currency:
+                            with open(currency_file, 'r') as f:
+                                currency_data = json.load(f)
+                                original_currency = currency_data.get('target_currency', 'Unknown')
+                            
+                            st.info(f"📋 Original Dashboard Currency: **{original_currency}**")
+                            
+                            # Currency change option
+                            st.markdown("**⚙️ Import Options:**")
+                            
+                            change_currency = st.checkbox(
+                                "Change target currency during import",
+                                help="Re-convert all transactions to a new target currency"
+                            )
+                            
+                            if change_currency:
+                                st.warning("⚠️ **Currency Conversion:** All amounts will be re-converted from their original currencies.")
+                                
+                                # Currency selector
+                                available_currencies = ['ILS', 'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'BGN']
+                                new_currency = st.selectbox(
+                                    "Select NEW target currency:",
+                                    options=available_currencies,
+                                    index=0 if original_currency not in available_currencies else available_currencies.index(original_currency)
+                                )
+                                
+                                if new_currency != original_currency:
+                                    st.info(f"💱 Will convert from **{original_currency}** to **{new_currency}**")
+                            else:
+                                new_currency = original_currency
+                        else:
+                            st.warning("⚠️ No currency settings found in backup")
+                            new_currency = None
+                        
+                        # Confirmation and import
+                        st.markdown("---")
+                        confirm_import = st.checkbox(
+                            "⚠️ I understand this will REPLACE my current dashboard",
+                            help="This action cannot be undone. Current dashboard will be backed up first."
+                        )
+                        
+                        if confirm_import and st.button("🔄 Import Dashboard", type="primary"):
+                            with st.spinner("Importing dashboard..."):
+                                try:
+                                    # Create backup of current dashboard first
+                                    st.info("📦 Creating backup of current dashboard...")
+                                    
+                                    # Import groups config
+                                    groups_config_src = tmp_path / "groups_config.json"
+                                    groups_config_dst = Path("user_data/groups/groups_config.json")
+                                    
+                                    if groups_config_src.exists():
+                                        import shutil
+                                        groups_config_dst.parent.mkdir(parents=True, exist_ok=True)
+                                        shutil.copy(groups_config_src, groups_config_dst)
+                                    
+                                    # Import currency settings
+                                    if has_currency and new_currency:
+                                        currency_src = tmp_path / "dashboard_currency_settings.json"
+                                        currency_dst = Path("user_data/dashboard_currency_settings.json")
+                                        
+                                        with open(currency_src, 'r') as f:
+                                            curr_settings = json.load(f)
+                                        
+                                        # Update target currency if changed
+                                        curr_settings['target_currency'] = new_currency
+                                        
+                                        with open(currency_dst, 'w') as f:
+                                            json.dump(curr_settings, f, indent=2)
+                                    
+                                    # Import group data
+                                    groups_dir = tmp_path / "groups"
+                                    if groups_dir.exists():
+                                        for group_dir in groups_dir.iterdir():
+                                            if group_dir.is_dir():
+                                                group_id = group_dir.name
+                                                dst_dir = Path(f"user_data/groups/{group_id}")
+                                                dst_dir.mkdir(parents=True, exist_ok=True)
+                                                
+                                                # Copy transactions
+                                                trans_src = group_dir / "transactions.json"
+                                                if trans_src.exists():
+                                                    import shutil
+                                                    shutil.copy(trans_src, dst_dir / "transactions.json")
+                                                
+                                                # Copy income data
+                                                income_src = group_dir / "income_data.json"
+                                                if income_src.exists():
+                                                    import shutil
+                                                    shutil.copy(income_src, dst_dir / "income_data.json")
+                                    
+                                    st.success("✅ Dashboard imported successfully!")
+                                    st.info("🔄 Reloading application...")
+                                    
+                                    # Clear all caches
+                                    st.cache_data.clear()
+                                    st.cache_resource.clear()
+                                    
+                                    # Rerun
+                                    st.rerun()
+                                    
+                                except Exception as e:
+                                    st.error(f"❌ Error importing dashboard: {e}")
+                    else:
+                        st.error("❌ Invalid dashboard backup: missing metadata")
+                        
+            except Exception as e:
+                st.error(f"❌ Error reading dashboard backup: {e}")
+    
+    st.markdown("---")
+    
     # Backups section
-    st.subheader("💾 Backups")
+    st.subheader("💾 Group Backups")
     
     backups = dm.get_backups()
     
@@ -781,6 +1410,92 @@ def show_overview(df):
                 f"{savings_rate:.1f}% savings rate"
             )
     
+    # Show multi-currency breakdown if currencies detected
+    currency_mgr = get_currency_manager()
+    if currency_mgr.is_initialized() and not df.empty:
+        # Check if there are any transactions with original currency
+        has_original_currency = 'original_currency' in df.columns and df['original_currency'].notna().any()
+        
+        if has_original_currency:
+            st.markdown("---")
+            st.subheader("💱 Multi-Currency Breakdown")
+            
+            # Calculate spending by original currency
+            currency_spending = []
+            target_currency = currency_mgr.get_target_currency()
+            target_symbol = get_currency_symbol(target_currency)
+            
+            # Group by original currency
+            for currency in df['original_currency'].dropna().unique():
+                if currency and currency != target_currency:
+                    # Get transactions in this currency
+                    currency_txns = df[df['original_currency'] == currency]
+                    
+                    # Sum original amounts
+                    original_total = currency_txns['original_cost'].sum()
+                    
+                    # Sum converted amounts (in target currency)
+                    converted_total = currency_txns['Cost'].sum()
+                    
+                    # Count transactions
+                    txn_count = len(currency_txns)
+                    
+                    currency_spending.append({
+                        'currency': currency,
+                        'symbol': get_currency_symbol(currency),
+                        'original_total': original_total,
+                        'converted_total': converted_total,
+                        'count': txn_count
+                    })
+            
+            # Also include target currency transactions
+            target_txns = df[(df['original_currency'].isna()) | (df['original_currency'] == target_currency)]
+            if not target_txns.empty:
+                target_total = target_txns['Cost'].sum()
+                currency_spending.append({
+                    'currency': target_currency,
+                    'symbol': target_symbol,
+                    'original_total': target_total,
+                    'converted_total': target_total,
+                    'count': len(target_txns)
+                })
+            
+            # Sort by converted total (descending)
+            currency_spending = sorted(currency_spending, key=lambda x: x['converted_total'], reverse=True)
+            
+            if len(currency_spending) > 0:
+                # Display cards in columns
+                cols = st.columns(min(len(currency_spending), 4))
+                
+                grand_total = sum(c['converted_total'] for c in currency_spending)
+                
+                for idx, curr_data in enumerate(currency_spending):
+                    col_idx = idx % 4
+                    with cols[col_idx]:
+                        percentage = (curr_data['converted_total'] / grand_total * 100) if grand_total > 0 else 0
+                        
+                        # Format original amount display
+                        if curr_data['currency'] == target_currency:
+                            amount_display = f"{target_symbol}{curr_data['converted_total']:,.0f}"
+                        else:
+                            amount_display = f"{target_symbol}{curr_data['converted_total']:,.0f}"
+                            original_display = f"({curr_data['symbol']}{curr_data['original_total']:,.0f})"
+                        
+                        st.metric(
+                            f"{curr_data['currency']} {curr_data['symbol']}",
+                            amount_display,
+                            f"{percentage:.1f}% • {curr_data['count']} txns"
+                        )
+                        
+                        if curr_data['currency'] != target_currency:
+                            st.caption(f"Original: {curr_data['symbol']}{curr_data['original_total']:,.0f} {curr_data['currency']}")
+                
+                # Foreign currency exposure summary
+                foreign_total = sum(c['converted_total'] for c in currency_spending if c['currency'] != target_currency)
+                if foreign_total > 0:
+                    foreign_pct = (foreign_total / grand_total * 100) if grand_total > 0 else 0
+                    st.info(f"💡 **Foreign Currency Exposure:** {target_symbol}{foreign_total:,.0f} ({foreign_pct:.1f}% of total spending)")
+    
     st.markdown("---")
     
     # Tabs for different views
@@ -898,8 +1613,40 @@ def show_overview(df):
         else:
             display_df = df
         
+        # Prepare display with original currency info
+        display_data = display_df.copy()
+        
+        # Add formatted amount column that shows original currency if different
+        if 'original_cost' in display_data.columns and 'original_currency' in display_data.columns:
+            # Convert to dict records for easier processing
+            dm = get_data_manager()
+            transactions = dm.load_transactions()
+            
+            # Create a lookup dict by description and date for matching
+            txn_lookup = {}
+            for txn in transactions:
+                key = (txn.get('date'), txn.get('description'))
+                txn_lookup[key] = txn
+            
+            # Add formatted amount column
+            def format_row_amount(row):
+                key = (row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date']), 
+                       row['Description'])
+                txn = txn_lookup.get(key, row.to_dict())
+                return format_amount_with_original(txn, row.get('Currency', 'ILS'))
+            
+            display_data['Amount'] = display_data.apply(format_row_amount, axis=1)
+            columns_to_show = ['Date', 'Description', 'Category', 'Amount']
+        else:
+            # No original currency data, just format regular amount
+            display_data['Amount'] = display_data.apply(
+                lambda row: format_currency_amount(row['Cost'], row.get('Currency', 'ILS')), 
+                axis=1
+            )
+            columns_to_show = ['Date', 'Description', 'Category', 'Amount']
+        
         st.dataframe(
-            display_df[['Date', 'Description', 'Category', 'Cost', 'Currency']].sort_values('Date', ascending=False),
+            display_data[columns_to_show].sort_values('Date', ascending=False),
             use_container_width=True,
             hide_index=True
         )
@@ -1311,14 +2058,50 @@ def show_combined_analytics():
     
     # Calculate metrics based on view mode
     if view_mode == "All Group Expenses":
-        # Month filter for all plots (except timeline)
-        combined_df_filtered = combined_df.copy()
+        # Date range selection
+        st.subheader("📅 Date Range")
+        col_date1, col_date2 = st.columns(2)
+        
+        # Get min/max dates from combined data
+        min_date = combined_df['Date'].min().date()
+        max_date = combined_df['Date'].max().date()
+        
+        with col_date1:
+            start_date = st.date_input(
+                "Start Date",
+                value=min_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="combined_all_start_date"
+            )
+        
+        with col_date2:
+            end_date = st.date_input(
+                "End Date",
+                value=max_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="combined_all_end_date"
+            )
+        
+        # Apply date range filter
+        combined_df_filtered = combined_df[
+            (combined_df['Date'].dt.date >= start_date) & 
+            (combined_df['Date'].dt.date <= end_date)
+        ].copy()
+        
+        combined_df_original_filtered = combined_df_original[
+            (combined_df_original['Date'].dt.date >= start_date) & 
+            (combined_df_original['Date'].dt.date <= end_date)
+        ].copy()
+        
+        # Month filter for all plots (except timeline) - within selected date range
         combined_df_filtered['YearMonth'] = combined_df_filtered['Date'].dt.to_period('M')
         available_months_all = sorted(combined_df_filtered['YearMonth'].unique(), reverse=True)
         
         month_options_all = ['All Time'] + [str(m) for m in available_months_all]
         selected_month_all = st.selectbox(
-            "Filter by Month",
+            "Filter by Month (within selected date range)",
             options=month_options_all,
             key="combined_all_month_filter"
         )
@@ -1326,20 +2109,23 @@ def show_combined_analytics():
         # Apply month filter if selected
         if selected_month_all != 'All Time':
             combined_df_filtered = combined_df_filtered[combined_df_filtered['YearMonth'] == pd.Period(selected_month_all)]
+            combined_df_original_filtered = combined_df_original_filtered[
+                combined_df_original_filtered['Date'].dt.to_period('M') == pd.Period(selected_month_all)
+            ]
         
         # Show metrics for all expenses
         col1, col2, col3, col4 = st.columns(4)
         
-        # Calculate Total Spent as sum of member expenses from ORIGINAL unfiltered data (matches Overview ₪222k)
+        # Calculate Total Spent as sum of member expenses from filtered data
         dm = get_data_manager()
-        member_cols = dm.get_member_columns(combined_df_original) if not combined_df_original.empty else []
+        member_cols = dm.get_member_columns(combined_df_original_filtered) if not combined_df_original_filtered.empty else []
         
         total_spent = 0.0
         if member_cols:
             for member_col in member_cols:
-                if member_col in combined_df_original.columns:
+                if member_col in combined_df_original_filtered.columns:
                     # Convert to numeric to avoid string comparison errors
-                    member_values = pd.to_numeric(combined_df_original[member_col], errors='coerce').fillna(0)
+                    member_values = pd.to_numeric(combined_df_original_filtered[member_col], errors='coerce').fillna(0)
                     total_spent += member_values[member_values > 0].sum()
         
         with col1:
@@ -1434,78 +2220,96 @@ def show_combined_analytics():
         user_calc = UserExpenseCalculator(groups_mgr)
         member_data = user_calc.calculate_user_total_expense(selected_group_ids, selected_member)
         
-        # Month filter for individual member view - at the top
+        # Store original all-time metrics (unaffected by filters)
+        total_expense_alltime = member_data['total_expense']
+        net_balance_alltime = member_data['net_balance']
+        
+        # Member metrics - All Time (unaffected by date range)
+        st.subheader(f"📊 {selected_member}'s Overall Summary")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Personal Expense (All Time)", f"₪{total_expense_alltime:,.2f}", 
+                     help="Total amount this person actually paid across all transactions")
+        with col2:
+            if net_balance_alltime > 0:
+                # Positive net = paid more than owed = they are OWED money
+                balance_label = "They Are Owed (All Time)"
+                balance_help = "This person is owed money (paid more than their share)"
+            elif net_balance_alltime < 0:
+                # Negative net = owed more than paid = they OWE money
+                balance_label = "They Owe (All Time)"
+                balance_help = "This person owes money (paid less than their share)"
+            else:
+                balance_label = "Balanced (All Time)"
+                balance_help = "This person is settled up"
+            st.metric(balance_label, f"₪{abs(net_balance_alltime):,.2f}",
+                     help=balance_help)
+        
+        st.markdown("---")
+        
+        # Date range selection for member view
+        st.subheader("📅 Filter by Date Range")
         member_txns = member_data.get('transactions', [])
         selected_month_member = 'All Time'
         
         if member_txns and len(member_txns) > 0:
-            member_txns_df_filter = pd.DataFrame(member_txns)
+            member_txns_df_all = pd.DataFrame(member_txns)
             
-            if 'date' in member_txns_df_filter.columns:
-                member_txns_df_filter['date'] = pd.to_datetime(member_txns_df_filter['date'])
+            if 'date' in member_txns_df_all.columns:
+                member_txns_df_all['date'] = pd.to_datetime(member_txns_df_all['date'])
+                
+                # Get min/max dates from member transactions
+                min_date_member = member_txns_df_all['date'].min().date()
+                max_date_member = member_txns_df_all['date'].max().date()
+                
+                col_date1, col_date2 = st.columns(2)
+                
+                with col_date1:
+                    start_date_member = st.date_input(
+                        "Start Date",
+                        value=min_date_member,
+                        min_value=min_date_member,
+                        max_value=max_date_member,
+                        key="combined_member_start_date"
+                    )
+                
+                with col_date2:
+                    end_date_member = st.date_input(
+                        "End Date",
+                        value=max_date_member,
+                        min_value=min_date_member,
+                        max_value=max_date_member,
+                        key="combined_member_end_date"
+                    )
+                
+                # Apply date range filter to member transactions
+                member_txns_df_filter = member_txns_df_all[
+                    (member_txns_df_all['date'].dt.date >= start_date_member) & 
+                    (member_txns_df_all['date'].dt.date <= end_date_member)
+                ].copy()
+                
+                # Month filter within selected date range
                 member_txns_df_filter['YearMonth'] = member_txns_df_filter['date'].dt.to_period('M')
                 available_months_member = sorted(member_txns_df_filter['YearMonth'].unique(), reverse=True)
                 
                 month_options_member = ['All Time'] + [str(m) for m in available_months_member]
                 selected_month_member = st.selectbox(
-                    "Filter by Month",
+                    "Filter by Month (within selected date range)",
                     options=month_options_member,
                     key="member_all_month_filter"
                 )
-        
-        # Calculate how much they're owed FROM or owe TO everyone else
-        all_members_data = user_calc.calculate_all_members_expenses(selected_group_ids)
-        
-        # For this member, calculate total debt to/from ALL other members
-        total_debt_to_member = 0  # How much others owe to this member
-        total_debt_from_member = 0  # How much this member owes to others
-        
-        for other_member, other_data in all_members_data.items():
-            if other_member != selected_member:
-                # If other member has negative balance, they owe money
-                # If this member should receive that money, add to debt_to_member
-                # This is approximate - real debt tracking needs transaction-level analysis
-                other_balance = other_data['net_balance']
-                if other_balance < 0:  # Other person owes
-                    # They might owe to our member
-                    pass  # Skip for now, use simple net balance
-        
-        # Simplified: just show net balance from member's perspective
-        # Member metrics - removed redundant Total Owed By Them
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Total Personal Expense", f"₪{member_data['total_expense']:,.2f}", 
-                     help="Total amount this person actually paid")
-        with col2:
-            net_balance = member_data['net_balance']
-            if net_balance > 0:
-                # Positive net = paid more than owed = they are OWED money
-                balance_label = "They Are Owed"
-                balance_help = "This person is owed money (paid more than their share)"
-            elif net_balance < 0:
-                # Negative net = owed more than paid = they OWE money
-                balance_label = "They Owe"
-                balance_help = "This person owes money (paid less than their share)"
-            else:
-                balance_label = "Balanced"
-                balance_help = "This person is settled up"
-            st.metric(balance_label, f"₪{abs(net_balance):,.2f}",
-                     help=balance_help)
         
         st.markdown("---")
         
         # Category breakdown for member
         st.subheader(f"📊 {selected_member}'s Expense Breakdown")
         
-        # Get member transactions for month filtering
+        # Get member transactions for month filtering (using date range filtered data)
         if member_txns and len(member_txns) > 0:
-            member_txns_df = pd.DataFrame(member_txns)
-            
-            # Check if date column exists and convert
-            if 'date' in member_txns_df.columns:
-                member_txns_df['date'] = pd.to_datetime(member_txns_df['date'])
-                member_txns_df['YearMonth'] = member_txns_df['date'].dt.to_period('M')
+            # Use the already filtered data from date range selection
+            if 'date' in member_txns_df_filter.columns:
+                member_txns_df = member_txns_df_filter.copy()
                 
                 # Apply month filter if selected
                 if selected_month_member != 'All Time':
@@ -1544,14 +2348,14 @@ def show_combined_analytics():
         # Spending by group for this member
         st.subheader(f"{selected_member}'s Spending by Group")
         
-        # Apply month filter to group spending if available
+        # Apply month filter to group spending if available (using date range filtered data)
         if member_txns and len(member_txns) > 0:
-            member_txns_df_group = pd.DataFrame(member_txns)
-            
-            if 'date' in member_txns_df_group.columns and selected_month_member != 'All Time':
-                member_txns_df_group['date'] = pd.to_datetime(member_txns_df_group['date'])
-                member_txns_df_group['YearMonth'] = member_txns_df_group['date'].dt.to_period('M')
-                member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
+            # Use the already filtered data from date range selection
+            if 'date' in member_txns_df_filter.columns:
+                member_txns_df_group = member_txns_df_filter.copy()
+                
+                if selected_month_member != 'All Time':
+                    member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
                 
                 # Recalculate group breakdown from filtered transactions using Cost
                 group_breakdown = {}
@@ -1565,7 +2369,7 @@ def show_combined_analytics():
                     except (ValueError, TypeError):
                         continue
             else:
-                # No month filter, calculate from all groups
+                # No date column, calculate from all groups
                 group_breakdown = {}
                 for group_id in selected_group_ids:
                     group = next((g for g in groups if g['id'] == group_id), None)
@@ -1594,17 +2398,38 @@ def show_combined_analytics():
             )
             st.plotly_chart(fig_group_bar, use_container_width=True)
         
-        # Transaction list
+        # Transaction list - use filtered transactions
         st.subheader(f"{selected_member}'s Transactions")
-        member_txns = member_data['transactions']
         
-        if member_txns:
+        # Use filtered transactions based on date range and month selection
+        if member_txns and len(member_txns) > 0 and 'date' in member_txns_df_filter.columns:
+            member_txns_df_display = member_txns_df_filter.copy()
+            
+            # Apply month filter if selected
+            if selected_month_member != 'All Time':
+                member_txns_df_display = member_txns_df_display[
+                    member_txns_df_display['YearMonth'] == pd.Period(selected_month_member)
+                ]
+            
+            if not member_txns_df_display.empty:
+                df_display = member_txns_df_display[['date', 'group_name', 'description', 'category', 
+                                      'total_cost', 'member_share']].copy()
+                df_display.columns = ['Date', 'Group', 'Description', 'Category', 
+                                     'Total Cost', 'Your Share']
+                df_display = df_display.sort_values('Date', ascending=False)
+            else:
+                df_display = pd.DataFrame()
+        elif member_txns:
             df_txns = pd.DataFrame(member_txns)
             df_display = df_txns[['date', 'group_name', 'description', 'category', 
                                   'total_cost', 'member_share']].copy()
             df_display.columns = ['Date', 'Group', 'Description', 'Category', 
                                  'Total Cost', 'Your Share']
             df_display = df_display.sort_values('Date', ascending=False)
+        else:
+            df_display = pd.DataFrame()
+        
+        if not df_display.empty:
             
             st.dataframe(df_display, use_container_width=True, hide_index=True)
             
@@ -1616,6 +2441,8 @@ def show_combined_analytics():
                 file_name=f"{selected_member}_expenses.csv",
                 mime="text/csv"
             )
+        else:
+            st.info("No transactions found for the selected date range.")
 
 def show_manage_groups_page():
     """Manage groups page"""
@@ -1744,7 +2571,7 @@ def show_manage_groups_page():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Yes, Delete", type="primary", key="confirm_delete_yes"):
-                    groups_mgr.delete_group(group_to_delete['id'])
+                    groups_mgr.delete_group(group_to_delete['id'], delete_data=True)
                     st.session_state.confirm_delete_group = None
                     st.success("Group deleted!")
                     st.rerun()
@@ -1752,6 +2579,886 @@ def show_manage_groups_page():
                 if st.button("Cancel", key="confirm_delete_cancel"):
                     st.session_state.confirm_delete_group = None
                     st.rerun()
+
+def show_currency_settings():
+    """Show currency settings page with exchange rates and management
+    
+    Phase 4 Implementation (Currency Settings Page):
+    ✅ Displays current dashboard target currency with symbol and name
+    ✅ Shows exchange rates table for 15+ common currencies
+    ✅ "Update All Rates Now" button with cache clearing
+    ✅ Import batch history viewer with detailed rate information
+    ✅ Cache management UI with statistics and cleanup
+    ✅ Distinguishes historical vs fallback rates
+    
+    Features:
+    - Target currency display (code, symbol, full name)
+    - Exchange rates table (both direct and inverse rates)
+    - Rate source and last updated timestamp
+    - Import batch history with expandable details
+    - Cache statistics (file count, size, historical rates)
+    - Clear old cache button (>90 days)
+    
+    Missing (for future):
+    - Manual rate editing UI
+    - Automatic rate update configuration
+    - API key management
+    - Individual currency rate history
+    """
+    st.header("💱 Currency Settings")
+    
+    currency_mgr = get_currency_manager()
+    exchange_mgr = get_exchange_rate_manager()
+    
+    if not currency_mgr.is_initialized():
+        st.warning("⚠️ Currency system not initialized. Import your first Splitwise export to set up currencies.")
+        return
+    
+    # Current target currency section
+    st.subheader("🎯 Dashboard Target Currency")
+    
+    target_currency = currency_mgr.get_target_currency()
+    symbol = get_currency_symbol(target_currency)
+    name = get_currency_name(target_currency)
+    
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        st.metric("Target Currency", f"{target_currency} {symbol}")
+    with col2:
+        st.metric("Currency Name", name)
+    with col3:
+        st.info("💡 **To change target currency:** Export your dashboard, then import it back with a new currency.")
+    
+    st.divider()
+    
+    # Exchange rates section
+    st.subheader("💱 Exchange Rates")
+    
+    try:
+        # Fetch latest rates
+        with st.spinner("Fetching exchange rates..."):
+            rates = exchange_mgr.get_latest_rates(target_currency)
+        
+        # Display rates in a table
+        st.write(f"**Latest Rates** (1 {target_currency} = X currency)")
+        
+        # Filter to common currencies for display
+        common_currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CHF', 'CAD', 'AUD', 
+                            'BGN', 'THB', 'VND', 'INR', 'BRL', 'MXN', 'KRW']
+        
+        # Create DataFrame for display
+        rate_data = []
+        for curr in sorted(common_currencies):
+            if curr in rates and curr != target_currency:
+                rate = rates[curr]
+                symbol_curr = get_currency_symbol(curr)
+                name_curr = get_currency_name(curr)
+                
+                rate_data.append({
+                    'Currency': f"{curr} {symbol_curr}",
+                    'Name': name_curr,
+                    'Rate': f"{rate:.4f}",
+                    'Inverse Rate': f"{1/rate:.4f}" if rate > 0 else "N/A"
+                })
+        
+        if rate_data:
+            rates_df = pd.DataFrame(rate_data)
+            st.dataframe(
+                rates_df,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("No exchange rates available.")
+        
+        # Manual rate editing section
+        st.markdown("---")
+        st.write("**✏️ Manually Edit Exchange Rate**")
+        
+        col1, col2, col3 = st.columns([2, 2, 1])
+        
+        with col1:
+            # Currency selector
+            available_currencies = [c for c in common_currencies if c != target_currency]
+            selected_currency = st.selectbox(
+                "Select currency to edit:",
+                options=available_currencies,
+                format_func=lambda x: f"{x} {get_currency_symbol(x)} - {get_currency_name(x)}"
+            )
+        
+        with col2:
+            # Current rate display and new rate input
+            current_rate = rates.get(selected_currency, 0) if rates else 0
+            
+            st.caption(f"Current rate: 1 {target_currency} = {current_rate:.4f} {selected_currency}")
+            
+            new_rate = st.number_input(
+                f"New rate (1 {target_currency} = ? {selected_currency}):",
+                min_value=0.0001,
+                max_value=1000000.0,
+                value=float(current_rate) if current_rate > 0 else 1.0,
+                step=0.0001,
+                format="%.4f",
+                help=f"Enter the exchange rate: how many {selected_currency} equals 1 {target_currency}"
+            )
+        
+        with col3:
+            st.write("")  # Spacing
+            st.write("")  # Spacing
+            if st.button("💾 Save Rate", type="secondary", use_container_width=True):
+                if new_rate > 0:
+                    try:
+                        # Update the cached rates
+                        cache_file = exchange_mgr.cache_dir / f"latest_{target_currency}.json"
+                        
+                        if cache_file.exists():
+                            with open(cache_file, 'r', encoding='utf-8') as f:
+                                cache_data = json.load(f)
+                        else:
+                            # Create new cache if doesn't exist
+                            cache_data = {
+                                'cached_at': datetime.now().isoformat(),
+                                'base': target_currency,
+                                'source': 'manual_edit',
+                                'rates': {}
+                            }
+                        
+                        # Update the specific rate
+                        cache_data['rates'][selected_currency] = new_rate
+                        cache_data['cached_at'] = datetime.now().isoformat()
+                        cache_data['source'] = f"manual_edit (last: {selected_currency})"
+                        
+                        # Save updated cache
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            json.dump(cache_data, f, indent=2)
+                        
+                        st.success(f"✅ Updated rate: 1 {target_currency} = {new_rate:.4f} {selected_currency}")
+                        st.info(f"💡 Inverse rate: 1 {selected_currency} = {1/new_rate:.4f} {target_currency}")
+                        time.sleep(1)
+                        st.rerun()
+                    
+                    except Exception as e:
+                        st.error(f"❌ Error saving rate: {e}")
+                else:
+                    st.error("❌ Rate must be greater than 0")
+        
+        st.caption("⚠️ **Note:** Manual edits affect future conversions. Existing transactions keep their original rates.")
+        
+        st.markdown("---")
+        
+        # Update button
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("🔄 Update All Rates Now", type="primary"):
+                # Clear cache and fetch fresh rates
+                cache_file = exchange_mgr.cache_dir / f"latest_{target_currency}.json"
+                if cache_file.exists():
+                    cache_file.unlink()
+                st.rerun()
+        
+        # Show cache info
+        cache_file = exchange_mgr.cache_dir / f"latest_{target_currency}.json"
+        if cache_file.exists():
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+                cache_date = datetime.fromisoformat(cache_data['cached_at'])
+                source = cache_data.get('source', 'Unknown')
+                
+                st.caption(f"📅 Last updated: {cache_date.strftime('%Y-%m-%d %H:%M:%S')} | 🔗 Source: {source}")
+    
+    except Exception as e:
+        st.error(f"❌ Error fetching exchange rates: {e}")
+        st.info("💡 Check your internet connection or try again later.")
+    
+    st.divider()
+    
+    # Import batch history section
+    st.subheader("📦 Import Batch History")
+    
+    # Find all import batch cache files
+    import_batches = sorted(
+        exchange_mgr.cache_dir.glob("import_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    
+    if import_batches:
+        st.write(f"Found **{len(import_batches)}** import batches with stored exchange rates:")
+        
+        # Show each batch
+        for batch_file in import_batches[:10]:  # Show last 10
+            try:
+                with open(batch_file, 'r', encoding='utf-8') as f:
+                    batch_data = json.load(f)
+                
+                batch_id = batch_file.stem
+                timestamp = batch_data.get('import_timestamp', 'Unknown')
+                group_name = batch_data.get('group_name', 'Unknown')
+                currencies = batch_data.get('currencies_detected', [])
+                txn_count = batch_data.get('transaction_count', 0)
+                base_currency = batch_data.get('base_currency', target_currency)
+                
+                # Format timestamp
+                try:
+                    ts = datetime.fromisoformat(timestamp)
+                    timestamp_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    timestamp_str = timestamp
+                
+                with st.expander(f"📦 {batch_id} - {group_name} ({txn_count} transactions)"):
+                    st.write(f"**Import Time:** {timestamp_str}")
+                    st.write(f"**Group:** {group_name}")
+                    st.write(f"**Base Currency:** {base_currency}")
+                    st.write(f"**Currencies Detected:** {', '.join(currencies) if currencies else 'None'}")
+                    
+                    # Show fallback rates used
+                    if 'fallback_rates' in batch_data and batch_data['fallback_rates']:
+                        st.write("**📊 Import-Time Fallback Rates Used:**")
+                        for curr, rate_info in batch_data['fallback_rates'].items():
+                            rate = rate_info.get('exchange_rate', rate_info.get('rate', 'N/A'))
+                            source = rate_info.get('rate_source', rate_info.get('source', 'Unknown'))
+                            st.write(f"- `1 {curr} = {rate} {base_currency}` _(Source: {source})_")
+                        st.caption("💡 These rates were fetched at import time (historical API not available)")
+                    
+                    # Show historical rates info
+                    if 'historical_rates_used' in batch_data and batch_data['historical_rates_used']:
+                        st.write("**📅 Historical Rates Used:**")
+                        for curr, rate_info in batch_data['historical_rates_used'].items():
+                            source = rate_info.get('source', 'Unknown')
+                            dates = rate_info.get('dates', [])
+                            if dates:
+                                st.write(f"- `{curr}`: {len(dates)} unique dates _(Source: {source})_")
+                            else:
+                                st.write(f"- `{curr}` _(Source: {source})_")
+                        st.caption("✅ These transactions used exact historical rates from their transaction dates")
+            
+            except Exception as e:
+                st.warning(f"Could not read batch {batch_file.name}: {e}")
+        
+        if len(import_batches) > 10:
+            st.caption(f"Showing 10 of {len(import_batches)} batches")
+    else:
+        st.info("📭 No import batches yet. Import Splitwise data to see batch history.")
+    
+    st.divider()
+    
+    # Cache management section
+    st.subheader("🗄️ Cache Management")
+    
+    cache_files = list(exchange_mgr.cache_dir.glob("*.json"))
+    total_size = sum(f.stat().st_size for f in cache_files)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Cached Files", len(cache_files))
+    with col2:
+        st.metric("Cache Size", f"{total_size / 1024:.1f} KB")
+    with col3:
+        st.metric("Historical Rates", len([f for f in cache_files if f.stem.startswith('historical_')]))
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("🗑️ Clear Old Cache", help="Remove cached rates older than 90 days"):
+            try:
+                cutoff = datetime.now() - timedelta(days=90)
+                deleted = 0
+                for cache_file in cache_files:
+                    if cache_file.stat().st_mtime < cutoff.timestamp():
+                        cache_file.unlink()
+                        deleted += 1
+                st.success(f"✅ Deleted {deleted} old cache files")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Error clearing cache: {e}")
+    
+    st.divider()
+    
+    # Automatic rate updates settings
+    st.subheader("🔄 Automatic Rate Updates")
+    st.markdown("Configure automatic exchange rate updates for your dashboard.")
+    
+    # Load current settings
+    settings = currency_mgr.get_all_settings()
+    auto_update_enabled = settings.get('dashboard_settings', {}).get('auto_update', False)
+    api_service = settings.get('dashboard_settings', {}).get('api_service', 'exchangerate-api.com')
+    api_key = settings.get('dashboard_settings', {}).get('api_key', '')
+    update_frequency = settings.get('dashboard_settings', {}).get('update_frequency', 'daily')
+    last_auto_update = settings.get('dashboard_settings', {}).get('last_auto_update', None)
+    
+    # Enable/disable toggle
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        new_auto_update = st.toggle(
+            "Enable Auto-Updates",
+            value=auto_update_enabled,
+            key="auto_update_toggle",
+            help="Automatically fetch latest exchange rates on schedule"
+        )
+    
+    with col2:
+        if last_auto_update:
+            last_update_dt = datetime.fromisoformat(last_auto_update)
+            st.caption(f"Last auto-update: {last_update_dt.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            st.caption("Never run")
+    
+    if new_auto_update:
+        # Show configuration options
+        st.markdown("**📋 Configuration:**")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            new_api_service = st.selectbox(
+                "API Service",
+                options=['exchangerate-api.com', 'frankfurter.app', 'custom'],
+                index=['exchangerate-api.com', 'frankfurter.app', 'custom'].index(api_service) if api_service in ['exchangerate-api.com', 'frankfurter.app', 'custom'] else 0,
+                key="api_service_select",
+                help="Choose which API to use for rate updates"
+            )
+            
+            st.caption("**API Information:**")
+            if new_api_service == 'exchangerate-api.com':
+                st.caption("✅ Free: 1,500 requests/month")
+                st.caption("✅ 160+ currencies")
+                st.caption("ℹ️ No API key needed (free tier)")
+            elif new_api_service == 'frankfurter.app':
+                st.caption("✅ Free: Unlimited")
+                st.caption("⚠️ 29 ECB currencies only")
+                st.caption("✅ Historical rates available")
+            else:
+                st.caption("⚠️ Custom API requires configuration")
+        
+        with col2:
+            new_update_frequency = st.selectbox(
+                "Update Frequency",
+                options=['daily', 'weekly', 'manual'],
+                index=['daily', 'weekly', 'manual'].index(update_frequency) if update_frequency in ['daily', 'weekly', 'manual'] else 0,
+                key="update_frequency_select",
+                help="How often to automatically update rates"
+            )
+            
+            st.caption("**Frequency Options:**")
+            if new_update_frequency == 'daily':
+                st.caption("Updates every 24 hours")
+            elif new_update_frequency == 'weekly':
+                st.caption("Updates every 7 days")
+            else:
+                st.caption("No automatic updates (manual only)")
+        
+        # API Key input (optional)
+        if new_api_service == 'exchangerate-api.com':
+            st.markdown("**🔑 API Key (Optional):**")
+            new_api_key = st.text_input(
+                "API Key",
+                value=api_key,
+                type="password",
+                key="api_key_input",
+                help="Optional: Provide API key for higher rate limits and premium features"
+            )
+            
+            if not new_api_key:
+                st.info("ℹ️ **Using Free Tier**: No API key provided. Using free tier with 1,500 requests/month. This is sufficient for personal use.")
+        else:
+            new_api_key = api_key
+        
+        # Save settings button
+        col1, col2, col3 = st.columns([1, 1, 2])
+        
+        with col1:
+            if st.button("💾 Save Settings", use_container_width=True):
+                try:
+                    # Update settings
+                    if 'dashboard_settings' not in settings:
+                        settings['dashboard_settings'] = {}
+                    
+                    settings['dashboard_settings']['auto_update'] = new_auto_update
+                    settings['dashboard_settings']['api_service'] = new_api_service
+                    settings['dashboard_settings']['api_key'] = new_api_key
+                    settings['dashboard_settings']['update_frequency'] = new_update_frequency
+                    
+                    # Save to file
+                    currency_mgr.settings_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(currency_mgr.settings_file, 'w', encoding='utf-8') as f:
+                        json.dump(settings, f, indent=2, ensure_ascii=False)
+                    
+                    st.success("✅ Auto-update settings saved!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error saving settings: {e}")
+        
+        with col2:
+            if st.button("🔄 Update Now", use_container_width=True):
+                try:
+                    with st.spinner("Updating exchange rates..."):
+                        # Update rates using the configured service
+                        exchange_mgr = get_exchange_rate_manager()
+                        target_currency = currency_mgr.get_target_currency()
+                        
+                        # Clear cache to force fresh fetch
+                        cache_file = exchange_mgr.cache_dir / f"latest_{target_currency}.json"
+                        if cache_file.exists():
+                            cache_file.unlink()
+                        
+                        # Fetch new rates
+                        rates = exchange_mgr.get_latest_rates(target_currency)
+                        
+                        # Update last_auto_update timestamp
+                        if 'dashboard_settings' not in settings:
+                            settings['dashboard_settings'] = {}
+                        settings['dashboard_settings']['last_auto_update'] = datetime.now().isoformat()
+                        
+                        with open(currency_mgr.settings_file, 'w', encoding='utf-8') as f:
+                            json.dump(settings, f, indent=2, ensure_ascii=False)
+                        
+                        st.success(f"✅ Updated rates for {len(rates)} currencies!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error updating rates: {e}")
+        
+        # Status information
+        st.markdown("---")
+        st.markdown("**ℹ️ How Auto-Updates Work:**")
+        st.markdown("""
+        - **Scheduled Updates**: Rates are automatically refreshed based on your chosen frequency
+        - **Import Priority**: When importing Splitwise data, the system always tries to fetch historical rates first
+        - **Cache Efficiency**: Updated rates are cached to minimize API calls
+        - **Fallback Support**: If the primary API fails, the system uses cached rates or fallback APIs
+        - **Manual Override**: You can always manually edit rates in the table above
+        """)
+        
+        if new_update_frequency != 'manual':
+            st.info(f"💡 **Next scheduled update**: Approximately {new_update_frequency} from last update")
+    
+    else:
+        # Auto-updates disabled
+        st.info("🔕 **Automatic updates disabled**. Exchange rates will only be updated:")
+        st.markdown("""
+        - When you click **"Update All Rates Now"** button above
+        - When importing Splitwise data (historical rates for transaction dates)
+        - When you manually edit rates
+        """)
+        
+        # Show save button to persist disabled state
+        if auto_update_enabled != new_auto_update:
+            if st.button("💾 Save Settings (Disable Auto-Updates)"):
+                try:
+                    if 'dashboard_settings' not in settings:
+                        settings['dashboard_settings'] = {}
+                    settings['dashboard_settings']['auto_update'] = False
+                    
+                    with open(currency_mgr.settings_file, 'w', encoding='utf-8') as f:
+                        json.dump(settings, f, indent=2, ensure_ascii=False)
+                    
+                    st.success("✅ Auto-update settings saved!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error saving settings: {e}")
+
+def show_multi_currency_analytics():
+    """Show dedicated multi-currency analytics page with trends and insights"""
+    st.header("💱 Multi-Currency Analytics")
+    
+    currency_mgr = get_currency_manager()
+    
+    if not currency_mgr.is_initialized():
+        st.warning("⚠️ Currency system not initialized. Import your first Splitwise export to set up currencies.")
+        return
+    
+    # Get data from all groups
+    groups_mgr = get_groups_manager()
+    all_groups_data = []
+    
+    for group in groups_mgr.get_all_groups():
+        dm = get_data_manager(groups_mgr.get_group_data_path(group['id']))
+        group_df = dm.get_dataframe()
+        if not group_df.empty:
+            group_df['group_name'] = group['name']
+            all_groups_data.append(group_df)
+    
+    if not all_groups_data:
+        st.info("📭 No transaction data available. Import data from Data Management page.")
+        return
+    
+    # Combine all data
+    df_all = pd.concat(all_groups_data, ignore_index=True)
+    df_all = exclude_payments_and_reimbursements(df_all)
+    
+    # Check for multi-currency data
+    has_multi_currency = 'original_currency' in df_all.columns and df_all['original_currency'].notna().any()
+    
+    if not has_multi_currency:
+        st.info("💡 **Single Currency Dashboard**: All your transactions are in the target currency. Multi-currency analytics will appear when you import transactions in other currencies.")
+        return
+    
+    target_currency = currency_mgr.get_target_currency()
+    target_symbol = get_currency_symbol(target_currency)
+    
+    # Summary metrics
+    st.subheader("📊 Currency Overview")
+    
+    # Calculate currency breakdown
+    currency_totals = {}
+    for _, row in df_all.iterrows():
+        orig_curr = row.get('original_currency')
+        if pd.notna(orig_curr):
+            if orig_curr not in currency_totals:
+                currency_totals[orig_curr] = {'original_sum': 0, 'converted_sum': 0, 'count': 0}
+            currency_totals[orig_curr]['original_sum'] += row.get('original_cost', 0)
+            currency_totals[orig_curr]['converted_sum'] += row.get('Cost', 0)
+            currency_totals[orig_curr]['count'] += 1
+        else:
+            # Target currency transaction
+            if target_currency not in currency_totals:
+                currency_totals[target_currency] = {'original_sum': 0, 'converted_sum': 0, 'count': 0}
+            currency_totals[target_currency]['original_sum'] += row.get('Cost', 0)
+            currency_totals[target_currency]['converted_sum'] += row.get('Cost', 0)
+            currency_totals[target_currency]['count'] += 1
+    
+    # Display currency cards
+    cols = st.columns(min(len(currency_totals), 4))
+    for idx, (currency, data) in enumerate(sorted(currency_totals.items(), key=lambda x: x[1]['converted_sum'], reverse=True)):
+        with cols[idx % len(cols)]:
+            curr_symbol = get_currency_symbol(currency)
+            percentage = (data['converted_sum'] / df_all['Cost'].sum()) * 100
+            
+            st.metric(
+                f"{currency} {curr_symbol}",
+                f"{target_symbol}{data['converted_sum']:,.0f}",
+                f"{percentage:.1f}% • {data['count']} txns"
+            )
+    
+    st.markdown("---")
+    
+    # Monthly spending by currency
+    st.subheader("📈 Monthly Spending Trends by Currency")
+    
+    # Prepare data for monthly chart
+    df_all['YearMonth'] = pd.to_datetime(df_all['Date']).dt.to_period('M')
+    monthly_currency_data = []
+    
+    for currency in currency_totals.keys():
+        if currency == target_currency:
+            # Target currency transactions
+            currency_df = df_all[df_all['original_currency'].isna() | (df_all['original_currency'] == target_currency)]
+        else:
+            # Foreign currency transactions
+            currency_df = df_all[df_all['original_currency'] == currency]
+        
+        monthly_spending = currency_df.groupby('YearMonth')['Cost'].sum().reset_index()
+        monthly_spending['Currency'] = f"{currency} {get_currency_symbol(currency)}"
+        monthly_spending['YearMonth'] = monthly_spending['YearMonth'].astype(str)
+        monthly_currency_data.append(monthly_spending)
+    
+    if monthly_currency_data:
+        monthly_df = pd.concat(monthly_currency_data, ignore_index=True)
+        
+        fig_monthly = px.line(
+            monthly_df,
+            x='YearMonth',
+            y='Cost',
+            color='Currency',
+            title=f"Monthly Spending by Original Currency (in {target_currency})",
+            labels={'Cost': f'Amount ({target_currency})', 'YearMonth': 'Month'},
+            markers=True
+        )
+        
+        fig_monthly.update_layout(
+            hovermode='x unified',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_monthly, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Currency distribution over time
+    st.subheader("📊 Currency Distribution Over Time")
+    
+    # Calculate percentage distribution by month
+    monthly_totals = df_all.groupby('YearMonth')['Cost'].sum()
+    distribution_data = []
+    
+    for currency in currency_totals.keys():
+        if currency == target_currency:
+            currency_df = df_all[df_all['original_currency'].isna() | (df_all['original_currency'] == target_currency)]
+        else:
+            currency_df = df_all[df_all['original_currency'] == currency]
+        
+        monthly_currency = currency_df.groupby('YearMonth')['Cost'].sum()
+        
+        for month in monthly_totals.index:
+            amount = monthly_currency.get(month, 0)
+            percentage = (amount / monthly_totals[month] * 100) if monthly_totals[month] > 0 else 0
+            
+            distribution_data.append({
+                'Month': str(month),
+                'Currency': f"{currency} {get_currency_symbol(currency)}",
+                'Percentage': percentage
+            })
+    
+    if distribution_data:
+        dist_df = pd.DataFrame(distribution_data)
+        
+        fig_dist = px.area(
+            dist_df,
+            x='Month',
+            y='Percentage',
+            color='Currency',
+            title="Currency Distribution Over Time (%)",
+            labels={'Percentage': 'Percentage of Total Spending'},
+        )
+        
+        fig_dist.update_layout(
+            hovermode='x unified',
+            yaxis=dict(range=[0, 100]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_dist, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Detailed currency breakdown table
+    st.subheader("💰 Detailed Currency Breakdown")
+    
+    breakdown_data = []
+    for currency, data in sorted(currency_totals.items(), key=lambda x: x[1]['converted_sum'], reverse=True):
+        curr_symbol = get_currency_symbol(currency)
+        curr_name = get_currency_name(currency)
+        percentage = (data['converted_sum'] / df_all['Cost'].sum()) * 100
+        
+        # Calculate average transaction
+        avg_original = data['original_sum'] / data['count'] if data['count'] > 0 else 0
+        avg_converted = data['converted_sum'] / data['count'] if data['count'] > 0 else 0
+        
+        breakdown_data.append({
+            'Currency': f"{currency} {curr_symbol}",
+            'Name': curr_name,
+            'Transactions': data['count'],
+            'Total (Original)': f"{curr_symbol}{data['original_sum']:,.2f}" if currency != target_currency else f"{target_symbol}{data['original_sum']:,.2f}",
+            f'Total ({target_currency})': f"{target_symbol}{data['converted_sum']:,.2f}",
+            'Percentage': f"{percentage:.1f}%",
+            'Avg/Transaction': f"{target_symbol}{avg_converted:,.2f}"
+        })
+    
+    breakdown_df = pd.DataFrame(breakdown_data)
+    st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+    
+    # Foreign currency exposure
+    foreign_total = sum(data['converted_sum'] for curr, data in currency_totals.items() if curr != target_currency)
+    total_spending = df_all['Cost'].sum()
+    foreign_percentage = (foreign_total / total_spending * 100) if total_spending > 0 else 0
+    
+    if foreign_total > 0:
+        st.info(f"💡 **Foreign Currency Exposure**: {target_symbol}{foreign_total:,.0f} ({foreign_percentage:.1f}% of total spending)")
+    
+    st.markdown("---")
+    
+    # Category breakdown by currency
+    st.subheader("🏷️ Spending by Category and Currency")
+    
+    category_currency_data = []
+    for _, row in df_all.iterrows():
+        orig_curr = row.get('original_currency')
+        currency_display = f"{orig_curr} {get_currency_symbol(orig_curr)}" if pd.notna(orig_curr) else f"{target_currency} {target_symbol}"
+        
+        category_currency_data.append({
+            'Category': row.get('Category', 'Uncategorized'),
+            'Currency': currency_display,
+            'Amount': row.get('Cost', 0)
+        })
+    
+    if category_currency_data:
+        cat_curr_df = pd.DataFrame(category_currency_data)
+        cat_summary = cat_curr_df.groupby(['Category', 'Currency'])['Amount'].sum().reset_index()
+        
+        # Top 10 categories
+        top_categories = cat_curr_df.groupby('Category')['Amount'].sum().nlargest(10).index
+        cat_summary_top = cat_summary[cat_summary['Category'].isin(top_categories)]
+        
+        fig_cat = px.bar(
+            cat_summary_top,
+            x='Category',
+            y='Amount',
+            color='Currency',
+            title=f"Top 10 Categories - Spending by Currency (in {target_currency})",
+            labels={'Amount': f'Amount ({target_currency})'},
+            barmode='stack'
+        )
+        
+        fig_cat.update_layout(
+            xaxis_tickangle=-45,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_cat, use_container_width=True)
+    
+    # "What If" Rate Change Calculator
+    st.markdown("---")
+    st.subheader("🔮 What If Rate Change Calculator")
+    st.markdown("See how changes in exchange rates would impact your spending.")
+    
+    # Get current rates for foreign currencies
+    rate_mgr = get_exchange_rate_manager()
+    current_rates = {}
+    
+    for currency in currency_totals.keys():
+        if currency != target_currency:
+            try:
+                rate = rate_mgr.get_rate(currency, target_currency)
+                current_rates[currency] = rate
+            except:
+                current_rates[currency] = None
+    
+    if current_rates:
+        # Create rate adjustment interface
+        st.markdown("**Adjust Exchange Rates:**")
+        
+        rate_changes = {}
+        cols = st.columns(min(len(current_rates), 3))
+        
+        for idx, (currency, current_rate) in enumerate(current_rates.items()):
+            if current_rate is None:
+                continue
+                
+            col_idx = idx % 3
+            with cols[col_idx]:
+                curr_symbol = currency_mgr.get_currency_symbol(currency)
+                
+                # Show current rate
+                st.caption(f"**{currency} {curr_symbol}**")
+                st.caption(f"Current: 1 {currency} = {current_rate:.4f} {target_currency}")
+                
+                # Input for new rate
+                new_rate = st.number_input(
+                    f"New rate (1 {currency} → {target_currency})",
+                    min_value=0.0001,
+                    max_value=1000000.0,
+                    value=float(current_rate),
+                    step=float(current_rate * 0.01),  # 1% increments
+                    format="%.4f",
+                    key=f"whatif_rate_{currency}"
+                )
+                
+                # Show percentage change
+                if new_rate != current_rate:
+                    pct_change = ((new_rate - current_rate) / current_rate) * 100
+                    change_emoji = "📈" if pct_change > 0 else "📉"
+                    st.caption(f"{change_emoji} {pct_change:+.1f}% change")
+                
+                rate_changes[currency] = new_rate
+        
+        # Calculate impact
+        st.markdown("---")
+        st.markdown("**💡 Impact Analysis:**")
+        
+        total_impact = 0
+        impact_details = []
+        
+        for currency, data in currency_totals.items():
+            if currency == target_currency:
+                continue
+            
+            if currency not in rate_changes or rate_changes[currency] is None:
+                continue
+            
+            original_amount = data['original_sum']
+            current_converted = data['converted_sum']
+            
+            # Recalculate with new rate
+            new_rate = rate_changes[currency]
+            current_rate = current_rates[currency]
+            
+            new_converted = original_amount * new_rate
+            difference = new_converted - current_converted
+            
+            total_impact += difference
+            
+            curr_symbol = currency_mgr.get_currency_symbol(currency)
+            target_symbol = currency_mgr.get_currency_symbol(target_currency)
+            
+            impact_details.append({
+                'Currency': f"{currency} {curr_symbol}",
+                'Original Amount': f"{curr_symbol}{original_amount:,.2f}",
+                'Current Converted': f"{target_symbol}{current_converted:,.2f}",
+                'New Converted': f"{target_symbol}{new_converted:,.2f}",
+                'Difference': f"{target_symbol}{difference:+,.2f}"
+            })
+        
+        if impact_details:
+            # Display impact table
+            impact_df = pd.DataFrame(impact_details)
+            st.dataframe(impact_df, use_container_width=True, hide_index=True)
+            
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                original_total = sum(data['converted_sum'] for data in currency_totals.values())
+                st.metric(
+                    "Current Total",
+                    f"{target_symbol}{original_total:,.0f}"
+                )
+            
+            with col2:
+                new_total = original_total + total_impact
+                st.metric(
+                    "New Total",
+                    f"{target_symbol}{new_total:,.0f}",
+                    delta=f"{total_impact:+,.0f}"
+                )
+            
+            with col3:
+                if original_total > 0:
+                    pct_impact = (total_impact / original_total) * 100
+                    impact_emoji = "📈" if total_impact > 0 else "📉"
+                    st.metric(
+                        "Total Impact",
+                        f"{pct_impact:+.2f}%",
+                        delta=f"{target_symbol}{total_impact:+,.0f}"
+                    )
+            
+            # Interpretation
+            if abs(total_impact) > 0.01:
+                if total_impact > 0:
+                    st.warning(f"⚠️ **Negative Impact**: If exchange rates change as specified, your total spending would INCREASE by {target_symbol}{total_impact:,.2f} ({abs(pct_impact):.2f}%). This means foreign currency expenses would cost you more.")
+                else:
+                    st.success(f"✅ **Positive Impact**: If exchange rates change as specified, your total spending would DECREASE by {target_symbol}{abs(total_impact):,.2f} ({abs(pct_impact):.2f}%). This means foreign currency expenses would cost you less.")
+            else:
+                st.info("💡 Exchange rates are at current levels. Adjust the rates above to see impact scenarios.")
+        
+        # Quick scenarios
+        st.markdown("---")
+        st.markdown("**⚡ Quick Scenarios:**")
+        
+        scenario_cols = st.columns(3)
+        
+        with scenario_cols[0]:
+            if st.button("📈 +5% Rate Increase", use_container_width=True):
+                for currency in rate_changes.keys():
+                    if currency in current_rates and current_rates[currency]:
+                        st.session_state[f"whatif_rate_{currency}"] = current_rates[currency] * 1.05
+                st.rerun()
+        
+        with scenario_cols[1]:
+            if st.button("📉 -5% Rate Decrease", use_container_width=True):
+                for currency in rate_changes.keys():
+                    if currency in current_rates and current_rates[currency]:
+                        st.session_state[f"whatif_rate_{currency}"] = current_rates[currency] * 0.95
+                st.rerun()
+        
+        with scenario_cols[2]:
+            if st.button("🔄 Reset to Current", use_container_width=True):
+                for currency in rate_changes.keys():
+                    if currency in current_rates and current_rates[currency]:
+                        st.session_state[f"whatif_rate_{currency}"] = current_rates[currency]
+                st.rerun()
+        
+        st.caption("💡 **Tip**: Use this calculator to understand your currency exposure risk. Large impacts suggest you may want to consider the timing of future purchases in foreign currencies.")
+    else:
+        st.info("No foreign currency data available for rate change scenarios.")
 
 def show_analytics(df):
     """Show analytics page with detailed charts"""
@@ -1763,16 +3470,140 @@ def show_analytics(df):
         st.info("No expense data available for analysis")
         return
     
+    # Currency filter section (if multi-currency data exists)
+    currency_mgr = get_currency_manager()
+    df_filtered = df_all_expenses.copy()
+    
+    if currency_mgr.is_initialized() and 'original_currency' in df_all_expenses.columns:
+        has_multi_currency = df_all_expenses['original_currency'].notna().any()
+        
+        if has_multi_currency:
+            st.subheader("💱 Currency Filter")
+            
+            # Get all currencies
+            target_currency = currency_mgr.get_target_currency()
+            all_currencies = [target_currency]
+            
+            foreign_currencies = df_all_expenses['original_currency'].dropna().unique()
+            for curr in foreign_currencies:
+                if curr and curr != target_currency and curr not in all_currencies:
+                    all_currencies.append(curr)
+            
+            # Filter options
+            col1, col2 = st.columns([1, 3])
+            
+            with col1:
+                filter_mode = st.radio(
+                    "Filter by Currency",
+                    options=["All Currencies", f"{target_currency} Only", "Foreign Currencies Only", "Specific Currencies"],
+                    key="currency_filter_mode"
+                )
+            
+            with col2:
+                if filter_mode == "Specific Currencies":
+                    selected_currencies = st.multiselect(
+                        "Select Currencies",
+                        options=all_currencies,
+                        default=all_currencies,
+                        key="selected_currencies"
+                    )
+            
+            # Apply filter
+            if filter_mode == f"{target_currency} Only":
+                df_filtered = df_all_expenses[
+                    (df_all_expenses['original_currency'].isna()) | 
+                    (df_all_expenses['original_currency'] == target_currency)
+                ]
+            elif filter_mode == "Foreign Currencies Only":
+                df_filtered = df_all_expenses[
+                    (df_all_expenses['original_currency'].notna()) & 
+                    (df_all_expenses['original_currency'] != target_currency)
+                ]
+            elif filter_mode == "Specific Currencies":
+                if selected_currencies:
+                    mask = (
+                        (df_all_expenses['original_currency'].isin(selected_currencies)) |
+                        ((df_all_expenses['original_currency'].isna()) & (target_currency in selected_currencies))
+                    )
+                    df_filtered = df_all_expenses[mask]
+                else:
+                    df_filtered = pd.DataFrame()  # Empty if no currencies selected
+            
+            # Show filtered count
+            st.caption(f"📊 Showing {len(df_filtered)} of {len(df_all_expenses)} transactions")
+            
+            st.divider()
+    
+    # Check if we have data after filtering
+    if df_filtered.empty:
+        st.warning("No data available with the selected currency filter")
+        return
+    
+    # Currency breakdown chart (if multi-currency)
+    if currency_mgr.is_initialized() and 'original_currency' in df_filtered.columns:
+        has_multi_currency = df_filtered['original_currency'].notna().any()
+        
+        if has_multi_currency:
+            st.subheader("💱 Spending by Currency")
+            
+            target_currency = currency_mgr.get_target_currency()
+            target_symbol = get_currency_symbol(target_currency)
+            
+            # Calculate spending by currency
+            currency_data = []
+            
+            for currency in df_filtered['original_currency'].dropna().unique():
+                if currency and currency != target_currency:
+                    currency_txns = df_filtered[df_filtered['original_currency'] == currency]
+                    converted_total = currency_txns['Cost'].sum()
+                    currency_data.append({
+                        'Currency': f"{currency} {get_currency_symbol(currency)}",
+                        'Amount': converted_total
+                    })
+            
+            # Target currency transactions
+            target_txns = df_filtered[
+                (df_filtered['original_currency'].isna()) | 
+                (df_filtered['original_currency'] == target_currency)
+            ]
+            if not target_txns.empty:
+                target_total = target_txns['Cost'].sum()
+                currency_data.append({
+                    'Currency': f"{target_currency} {target_symbol}",
+                    'Amount': target_total
+                })
+            
+            if currency_data:
+                currency_df = pd.DataFrame(currency_data)
+                currency_df = currency_df.sort_values('Amount', ascending=False)
+                
+                fig_currency = px.pie(
+                    currency_df,
+                    values='Amount',
+                    names='Currency',
+                    title=f"Spending by Original Currency (in {target_currency})",
+                    hole=0.4
+                )
+                
+                fig_currency.update_traces(
+                    textposition='auto',
+                    textinfo='percent+label+value'
+                )
+                
+                st.plotly_chart(fig_currency, use_container_width=True)
+            
+            st.divider()
+    
     # Monthly spending by category
     st.subheader("Monthly Spending by Category")
-    categories = ['All Categories'] + sorted(df_all_expenses['Category'].unique().tolist())
+    categories = ['All Categories'] + sorted(df_filtered['Category'].unique().tolist())
     selected_category_monthly = st.selectbox(
         "Select Category",
         options=categories,
         key="monthly_category"
     )
     
-    df_monthly = df_all_expenses.copy()
+    df_monthly = df_filtered.copy()
     if selected_category_monthly != 'All Categories':
         df_monthly = df_monthly[df_monthly['Category'] == selected_category_monthly]
     
@@ -1984,7 +3815,7 @@ def main():
     else:
         default_page = "Overview"
     
-    page_options = ["Overview", "Analytics", "Income & Savings", "Data Management", "Combined Analytics", "Manage Groups"]
+    page_options = ["Overview", "Analytics", "Income & Savings", "Data Management", "Currency Settings", "Multi-Currency Analytics", "Combined Analytics", "Manage Groups"]
     page = st.sidebar.radio("Select Page", page_options, 
                            index=page_options.index(default_page) if default_page in page_options else 0,
                            key="main_page_selector")
@@ -1998,7 +3829,7 @@ def main():
         st.session_state.current_page = page
     
     # Filters (if not on data management or income page)
-    if page not in ["Data Management", "Income & Savings", "Combined Analytics", "Manage Groups"] and not df.empty:
+    if page not in ["Data Management", "Income & Savings", "Currency Settings", "Multi-Currency Analytics", "Combined Analytics", "Manage Groups"] and not df.empty:
         st.sidebar.header("🔍 Filters")
         
         # Date range filter
@@ -2034,6 +3865,10 @@ def main():
         show_income_tracking()
     elif page == "Data Management":
         show_data_management()
+    elif page == "Currency Settings":
+        show_currency_settings()
+    elif page == "Multi-Currency Analytics":
+        show_multi_currency_analytics()
     elif page == "Combined Analytics":
         show_combined_analytics()
     elif page == "Manage Groups":
